@@ -693,9 +693,10 @@ const FAST_SKIP = FAST_MODE ? new Set(['config', 'tune', 'kernel']) : null;
 const DEEP_SKIP = DEEP_MODE ? new Set(['kernel']) : null;
 const want = (p) => (RUN_ALL || PHASES.includes(p)) && !(FAST_SKIP && FAST_SKIP.has(p)) && !(DEEP_SKIP && DEEP_SKIP.has(p));
 const ST = A.state || {};   // carried state from a prior phase invocation
-// WarmStart can replay a kernel through runIntegrateBothLegs() before the
-// TuningSkillset source block is reached. Initialize this carried state before
-// that path becomes reachable; the tuning phase later reassigns it.
+// Hoisted: tuningIntegrateInputs() is reachable from runIntegrateBothLegs, which runs long before the
+// TuningSkillset phase body — WarmStart replays a kernel through that path. Declaring `tuning` down at
+// that phase left it in the temporal dead zone and threw "Cannot access 'tuning' before initialization"
+// on the first integrate leg. The tuning phase later reassigns it.
 let tuning = ST.tuning || null;
 if (FAST_MODE) log(`[fast-mode] ON: skipping ConfigSweep + Milestone; HeadKernel-only; budget ${Math.round(FAST_BUDGET_MS / 60000)}min (stop new heads at ${Math.round(FAST_HEAD_DEADLINE_MS / 60000)}min, per-head workflow cap ${Math.round(FAST_HEAD_WF_MS / 60000)}min).`);
 
