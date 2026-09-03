@@ -628,12 +628,23 @@ class TestHarnessRegime(unittest.TestCase):
         self.assertFalse(spec0["needs_scales"])
 
     def test_fp8_is_fnuz_by_arch(self):
-        """The ONE hardware-specific axis: MI300 (gfx942/CDNA3) = fnuz fp8; MI355 (gfx950/CDNA4) = OCP fn."""
+        """WITHIN CDNA, the fp8 format is the one hardware axis that matters here: MI300
+        (gfx942/CDNA3) = fnuz, MI355 (gfx950/CDNA4) = OCP fn. It is NOT the only axis across AMD GPUs
+        generally -- see test_fp8_format_is_not_the_same_question_as_fp8_existing."""
         self.assertTrue(harness_lib.fp8_is_fnuz("gfx942"))
         self.assertTrue(harness_lib.fp8_is_fnuz("gfx942:sramecc+:xnack-"))
         self.assertTrue(harness_lib.fp8_is_fnuz("gfx90a"))
         self.assertFalse(harness_lib.fp8_is_fnuz("gfx950"))
         self.assertFalse(harness_lib.fp8_is_fnuz(""))
+
+    def test_fp8_format_is_not_the_same_question_as_fp8_existing(self):
+        """fp8_is_fnuz returns a confident False (= "OCP") for gfx1151, which has no fp8 matrix path
+        at all -- WMMA on RDNA3.5 does bf16/fp16/iu8/iu4. Reading that False as "OCP fp8 is fine here"
+        is exactly the trap; has_native_fp8 is the question to ask."""
+        self.assertFalse(harness_lib.fp8_is_fnuz("gfx1151"))
+        self.assertFalse(harness_lib.has_native_fp8("gfx1151"))
+        for cdna in ("gfx942", "gfx950"):
+            self.assertTrue(harness_lib.has_native_fp8(cdna), cdna)
 
     def test_pack_x_arch_independent(self):
         """Layout math is arch-independent: every fp8 variant is 1 byte -> x=16 on MI300 AND MI355."""

@@ -374,11 +374,17 @@
         ]
       ],
       "_vgpr_occupancy_basis": "compiler-derived (same sweep, measured on gfx1151 itself).",
+      "lds_per_wgp_kib": 128,
+      "lds_banks": 32,
+      "dynamic_vgpr": false,
+      "mfma_valu_coexec": false,
       "isa_types": [
         "WMMA"
       ],
       "scaled_mfma": false,
-      "_note": "Strix Halo APU (AI MAX 395/495); WMMA _w32, LPDDR-attached -- treat the memory roofline as APU-shared, not discrete-GPU HBM"
+      "_note": "Strix Halo APU (AI MAX 395/495); WMMA _w32, LPDDR-attached -- treat the memory roofline as APU-shared, not discrete-GPU HBM. lds_per_cu_kib is ABSENT ON PURPOSE (as on every RDNA entry): shared memory is per-WGP with a lower per-workgroup cap, so lds_per_cu() returns None and callers must read lds_per_wgp_kib + lds_per_wg_kib themselves. Do not add a per-CU number here.",
+      "_gap": "MEASURED FIELDS STILL MISSING for this arch -- absent, not zero. No LDS/scheduling timings: ds_read_b128_conflict_free_cyc, ds_read_b64_conflict_free_cyc, ds_read_b128_full_conflict_stride_bytes, lds_bytes_per_clk, lds_min_alloc_bytes, buffer_load_issue_cyc, lds_sp_fifo_entries_per_simd_pair, tcp_inflight_cap_kib, lds_cacheline_bytes. No WMMA issue cadence (the mfma_cadence_cyc analogue) and no matrix_layout_family -- RDNA3.5 WMMA uses the gfx11 operand layout, which differs from gfx1201's v8-operand form, so do NOT copy gfx1201's string. direct_to_lds_bit_widths and gws are unverified on gfx11 and are omitted rather than guessed. Each needs a microbenchmark on the part; a CDNA or RDNA4 value substituted here would be confidently wrong.",
+      "_fp8": "No fp8 matrix path. WMMA on RDNA3.5 does bf16/fp16/iu8/iu4 only; fp8 WMMA arrives with RDNA4. fp8_dtype is therefore absent, matching e2e_workflow/scripts/harness_lib.py has_native_fp8()."
     },
     "gfx1100": {
       "family": "RDNA3",
