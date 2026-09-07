@@ -492,3 +492,159 @@ def test_promoted_final_is_hot_and_cold_stays_a_diagnostic(tmp_path: Path) -> No
     assert am["cold_speedup"] == pytest.approx(geak_cold_final / orch_cold, abs=1e-4)
     hot_over_cold = am["geak_hot_final_tok_s"] / orch_cold
     assert am["cold_speedup"] < hot_over_cold
+
+
+# --- Regression: an unverified upstream same-config reference -----------------
+#
+# Anchored on the real Hyperloom run MiniMax-M3-MXFP4/20260904T002558Z-3de91cb3,
+# which handed GEAK `orchestrator_best_tput_same_config: 0.0` with
+# `same_config_reference_status: "unverified"` and zero accepted kernels. The
+# session still reported hot_speedup ~1.19 -- entirely Hyperloom's OWN explore
+# gain, because hot_speedup's denominator is the RAW session baseline
+# (3693.71 tok/s hot measure round) and its numerator is the post-explore
+# accepted config (measured on-hardware at 4379.15 tok/s under warm_server).
+
+
+def _minimax_handoff(
+    *,
+    status: str | None = "unverified",
+    exp_root: Path | None = None,
+) -> dict:
+    h = {
+        "workload": {"isl": 8192, "osl": 1024, "conc": 64},
+        "raw_baseline_tput": 3693.7114118953027,
+        "orchestrator_best_tput_same_config": 0.0,
+    }
+    if status is not None:
+        h["same_config_reference_status"] = status
+    if exp_root is not None:
+        # Hyperloom's double-run baseline: a full warmup round it discarded,
+        # then the hot measure round that became state.baseline_tput. Without
+        # this verdict the hot-to-hot pairings correctly degrade to None.
+        (exp_root / "state.json").write_text(
+            json.dumps({
+                "baseline_tput": 3693.7114118953027,
+                "baseline_warm_runtime_sec": 53.23,
+                "baseline_measure_round_dropped": False,
+            }),
+            encoding="utf-8",
+        )
+        h["exp_root"] = str(exp_root)
+    return h
+
+
+def test_unverified_same_config_reference_is_named_as_upstream_gap(
+    tmp_path: Path,
+) -> None:
+    """A 0.0 reference the orchestrator called unverified is not GEAK's failure."""
+    eval_dir = tmp_path / "e2e"
+    eval_dir.mkdir()
+    wf = _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0)
+
+    out = rx.normalize_result(_minimax_handoff(), wf)
+    al = out["baseline_alignment"]
+
+    assert al["status"] == "unavailable_reference_unverified"
+    assert al["same_config_reference_status"] == "unverified"
+    # The reference really is absent -- the new status must not invent one.
+    assert out["baseline_basis"]["current_best_same_config_divergence_pct"] is None
+    json.dumps(out, allow_nan=False)
+
+
+def test_verified_and_missing_status_keep_the_plain_unavailable_status(
+    tmp_path: Path,
+) -> None:
+    """Only a non-"verified" upstream verdict earns the sharper status."""
+    cases = (
+        ("verified", "unavailable"),
+        ("VERIFIED", "unavailable"),
+        (None, "unavailable"),
+        ("", "unavailable"),
+        ("unverified", "unavailable_reference_unverified"),
+        ("stale", "unavailable_reference_unverified"),
+    )
+    for index, (status, expected) in enumerate(cases):
+        eval_dir = tmp_path / f"e2e_{index}"
+        eval_dir.mkdir()
+        out = rx.normalize_result(
+            _minimax_handoff(status=status),
+            _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0),
+        )
+        al = out["baseline_alignment"]
+        assert al["status"] == expected, (status, al["status"])
+        # Normalized to lowercase, None when the handoff said nothing at all.
+        assert al["same_config_reference_status"] == (
+            status.lower() if status else None
+        )
+
+
+def test_hot_speedup_declares_its_denominator_and_config_gain(
+    tmp_path: Path,
+) -> None:
+    """hot_speedup must self-label as raw-baseline-relative, not GEAK-only."""
+    eval_dir = tmp_path / "e2e"
+    eval_dir.mkdir()
+    (eval_dir / "baseline").mkdir()
+    (eval_dir / "validation" / "final").mkdir(parents=True)
+    # GEAK's own warm_server measurement of the seeded (already-accepted) config:
+    # the discarded cold outer round + the hot median, both real numbers.
+    (eval_dir / "baseline" / "bench_summary.json").write_text(
+        json.dumps({"output_throughput_tok_s_median": 4379.154,
+                    "cold_output_throughput_tok_s": 2580.58}),
+        encoding="utf-8",
+    )
+    (eval_dir / "validation" / "final" / "bench_summary.json").write_text(
+        json.dumps({"output_throughput_tok_s_median": 4379.154,
+                    "cold_output_throughput_tok_s": 2580.58}),
+        encoding="utf-8",
+    )
+    wf = _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0)
+
+    out = rx.normalize_result(_minimax_handoff(exp_root=tmp_path), wf)
+    am = out["alignment_metrics"]
+
+    # GEAK accepted nothing here, and hot_geak_speedup says so honestly...
+    assert am["hot_geak_speedup"] == pytest.approx(1.0, abs=1e-4)
+    # ...while hot_speedup is ~1.19 purely from Hyperloom's own config gain.
+    assert am["hot_speedup"] == pytest.approx(4379.154 / 3693.7114118953027,
+                                             abs=1e-3)
+    assert am["hot_speedup"] > 1.15
+    # Which is exactly why the block must say whose gain that is.
+    assert am["hot_speedup_denominator"] == "raw_session_baseline"
+    assert am["hot_speedup_includes_orchestrator_config_gain"] is True
+    # The only same-config pairing -- absent, because upstream never verified it.
+    assert am["hot_speedup_same_config"] is None
+    json.dumps(out, allow_nan=False)
+
+
+def test_unverified_reference_caveat_reaches_the_rendered_report(
+    tmp_path: Path,
+) -> None:
+    """The status is useless if only the JSON carries the explanation."""
+    eval_dir = tmp_path / "e2e"
+    eval_dir.mkdir()
+    out = rx.normalize_result(
+        _minimax_handoff(),
+        _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0),
+    )
+    section = rx._render_baseline_alignment_section(out)
+
+    assert "unavailable_reference_unverified" in section
+    assert "upstream handoff gap" in section
+    assert "hot_geak_speedup" in section
+    # Idempotent, like the rest of the section.
+    assert rx._render_baseline_alignment_section(out) == section
+
+
+def test_verified_reference_report_has_no_unverified_caveat(
+    tmp_path: Path,
+) -> None:
+    eval_dir = tmp_path / "e2e"
+    eval_dir.mkdir()
+    out = rx.normalize_result(
+        _minimax_handoff(status="verified"),
+        _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0),
+    )
+    section = rx._render_baseline_alignment_section(out)
+
+    assert "upstream handoff gap" not in section

@@ -2033,6 +2033,7 @@ def _positive_finite_float(value: Any) -> float:
 def _build_baseline_alignment(
     same_config_divergence_pct: float | None,
     recipe_aligned: bool = True,
+    same_config_reference_status: str = "",
 ) -> dict[str, Any]:
     """Classify cross-harness alignment using only the same-config metric.
 
@@ -2043,9 +2044,22 @@ def _build_baseline_alignment(
     evidence about the launch recipe, not about the box or the bench client.
     Saying that in the status keeps the number from being read as "GEAK
     measured slow".
+
+    ``same_config_reference_status`` is the orchestrator's own verdict on the
+    same-config reference it forwarded (handoff ``same_config_reference_status``).
+    A bare ``"unavailable"`` reads as "GEAK failed to compute it"; when the
+    orchestrator shipped ``orchestrator_best_tput_same_config: 0.0`` with an
+    ``unverified`` status, the number was never measured upstream and no amount
+    of GEAK-side work can produce it. Naming that in the status is the
+    difference between a fixable gap and a silent dead end.
     """
+    reference_status = str(same_config_reference_status or "").strip().lower()
     if same_config_divergence_pct is None:
-        status = "unavailable"
+        status = (
+            "unavailable_reference_unverified"
+            if reference_status and reference_status != "verified"
+            else "unavailable"
+        )
     elif abs(same_config_divergence_pct) > SAME_CONFIG_DIVERGENCE_WARN_PCT:
         status = "warning" if recipe_aligned else "warning_recipe_unaligned"
     else:
@@ -2057,6 +2071,9 @@ def _build_baseline_alignment(
         "warning_threshold_pct": SAME_CONFIG_DIVERGENCE_WARN_PCT,
         "raw_session_divergence_is_measurement_signal": False,
         "recipe_aligned_with_orchestrator": recipe_aligned,
+        # Verbatim from the handoff ("" on orchestrator-less runs), so a reader
+        # can tell WHOSE side the missing reference is on.
+        "same_config_reference_status": reference_status or None,
     }
 
 
@@ -2500,6 +2517,10 @@ def normalize_result(h: dict, wf: dict) -> dict:
     orch_same_cfg = _positive_finite_float(
         h.get("orchestrator_best_tput_same_config")
     )
+    # The orchestrator's verdict on the reference above. "verified" means it
+    # really re-measured GEAK's seed config; anything else means the 0.0 is an
+    # absence, not a measurement.
+    orch_same_cfg_status = str(h.get("same_config_reference_status") or "").strip().lower()
     raw_session_divergence_pct = _divergence_pct(geak_baseline, orch_baseline)
     same_config_divergence_pct = _divergence_pct(geak_baseline, orch_same_cfg)
 
@@ -2523,7 +2544,7 @@ def normalize_result(h: dict, wf: dict) -> dict:
         ),
     }
     baseline_alignment = _build_baseline_alignment(
-        same_config_divergence_pct, recipe_aligned
+        same_config_divergence_pct, recipe_aligned, orch_same_cfg_status
     )
     baseline_basis = {
         # GEAK's own measured baseline (Hyperloom-accepted config = fair engagement baseline; gating uses this).
@@ -2631,6 +2652,22 @@ def normalize_result(h: dict, wf: dict) -> dict:
         # The same anchor, exposed only when it is provably a hot measure round.
         "orchestrator_hot_baseline_tok_s": orch_hot_baseline or None,
         "hot_speedup": _safe_ratio(geak_hot_final, orch_hot_baseline),
+        # WHOSE gain hot_speedup contains. Its denominator is Hyperloom's RAW
+        # session baseline, which predates the config Hyperloom itself accepted
+        # before handing GEAK the seed. So whenever the orchestrator did not
+        # verify a same-config reference, hot_speedup carries Hyperloom's own
+        # explore gain on top of (or instead of) anything GEAK did: a session
+        # with accepted_kernels == [] and hot_geak_speedup == 1.0 still reports
+        # a hot_speedup well above 1. Measured on MiniMax-M3-MXFP4
+        # 20260904T002558Z-3de91cb3: hot_speedup 1.186 against zero accepted
+        # kernels. Read hot_geak_speedup for what GEAK actually contributed.
+        "hot_speedup_denominator": "raw_session_baseline",
+        "hot_speedup_includes_orchestrator_config_gain": True,
+        # The same hot-to-hot ratio against the orchestrator's throughput on
+        # GEAK's OWN seed config -- the only pairing in this block whose
+        # numerator and denominator share a config. None when the orchestrator
+        # never verified that reference.
+        "hot_speedup_same_config": _safe_ratio(geak_hot_final, orch_same_cfg),
         "hot_geak_speedup": _safe_ratio(geak_hot_final, geak_hot_baseline),
         "cold_speedup": _safe_ratio(geak_cold_final, orch_baseline),
         "cold_geak_speedup": _safe_ratio(geak_cold_final, geak_cold_baseline),
@@ -2994,6 +3031,27 @@ def _render_baseline_alignment_section(result: dict[str, Any]) -> str:
     stack = result.get("serving_stack") or {}
     launcher = str(stack.get("launcher") or "unknown")
     recipe_aligned = bool(alignment.get("recipe_aligned_with_orchestrator", True))
+    # "unavailable" alone reads as "GEAK failed to compute it". Say whose side
+    # the gap is on when the orchestrator itself never verified the reference.
+    reference_caveat = (
+        [
+            "",
+            (
+                "The same-config number above is missing because the upstream "
+                "orchestrator shipped it `"
+                f"{alignment.get('same_config_reference_status') or 'unverified'}"
+                "` — it never re-measured GEAK's seed config, so there is no "
+                "reference to diverge from. This is an upstream handoff gap, not "
+                "a GEAK measurement failure, and nothing on the GEAK side can "
+                "fill it in. Until it is verified, read `hot_geak_speedup` (not "
+                "`hot_speedup`) for GEAK's own contribution: `hot_speedup` is "
+                "measured against the raw session baseline and therefore still "
+                "carries the orchestrator's own accepted-config gain."
+            ),
+        ]
+        if status == "unavailable_reference_unverified"
+        else []
+    )
     recipe_caveat = (
         []
         if recipe_aligned
@@ -3027,6 +3085,7 @@ def _render_baseline_alignment_section(result: dict[str, Any]) -> str:
             f"- Same-config divergence: {same_config_divergence}",
             f"- Alignment status: `{status}` (warning threshold: ±{threshold})",
             f"- Server launch recipe: `{launcher}`",
+            *reference_caveat,
             *recipe_caveat,
             "",
             "Raw-session audit comparison:",
