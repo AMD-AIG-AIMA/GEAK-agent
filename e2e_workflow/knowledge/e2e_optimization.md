@@ -81,10 +81,9 @@ number quickly without re-doing hours of low-value work.
 
 ## Measurement discipline (e2e is noisy)
 - Keep the server WARM across validations; never fold server-startup into the timed window.
-- Run enough requests (≥ 5× concurrency). The round count belongs to the lifecycle, not to you: the
-  default `warm_server` spends round 1 warming the prefix cache, discards it, and reports round 2, so
-  there is one timed sample and `spread` is structurally 0.0% — an absence of evidence, not a quiet
-  box. Repeat (`REPLICAS>1` or `isolated_server`) only when you actually need a dispersion estimate.
+- Run enough requests (≥ 5× concurrency). The round count belongs to the lifecycle, not to you: under
+  the default `warm_server` there is one timed sample and `spread` is structurally 0.0% — an absence
+  of evidence, not a quiet box. Repeat only when you need a dispersion estimate.
 - Gate a kernel into e2e only when its isolated speedup is real AND Amdahl says it can move the
   needle. Accept an e2e change only if the throughput delta exceeds the measured noise band.
 - Always check **output parity** (greedy/temp=0, fixed seed) vs baseline — a faster wrong server is

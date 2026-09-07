@@ -340,11 +340,10 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
         "parity_replicas": 1,
         "search_replicas": 1,
         "validation_replicas": 3,
-        # validation_rounds=1 is the whole of Hyperloom's protocol, not a truncation: two client
-        # passes on one server, report the second.  A 3-round median would be a different
-        # statistic from the one it rebenches against.
+        # warm_server IS Hyperloom's protocol, not a truncation of a longer one: two client passes
+        # on one server, report the second.  A 3-round median would be a different statistic from
+        # the one it rebenches against, so the round count is not a knob here.
         "validation_measurement_mode": "warm_server",
-        "validation_rounds": 1,
         # Hyperloom already did config/param search in EXPLORE; do not double-run.
         "config_tune": "false",
         # Produce the final/ bundle (final_launch.sh + overlay) so the caller can

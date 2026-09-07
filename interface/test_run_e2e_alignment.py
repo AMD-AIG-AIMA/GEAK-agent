@@ -316,13 +316,13 @@ def test_map_args_consumes_schema_v2_effective_config(tmp_path: Path) -> None:
     assert "SGLANG_USE_AITER=1" in ps["initial_extra_env"]
     assert ps["initial_overlay_pythonpath"] == f"{overlay}:{snapshot}"
     assert len(ps["effective_config_digest"]) == 64
-    # ONE lifecycle for the whole run, and it is Hyperloom's: 1 boot per leg,
-    # a discarded full warmup round, then the timed round.  validation_rounds=1
-    # means exactly two client passes with the second one reported, which is
-    # what warmup_round/measure_round does.
+    # ONE lifecycle for the whole run, and it is Hyperloom's: 1 boot per leg, a discarded
+    # full warmup round, then the timed round -- exactly two client passes with the second
+    # one reported, which is what warmup_round/measure_round does.  The round count is not
+    # a separate knob; it is what warm_server means.
     assert ps["measurement_mode"] == "warm_server"
     assert ps["validation_measurement_mode"] == "warm_server"
-    assert ps["validation_rounds"] == 1
+    assert "validation_rounds" not in ps
     # Only consulted if a caller pins validation back to isolated_server.
     assert ps["validation_replicas"] == 3
 

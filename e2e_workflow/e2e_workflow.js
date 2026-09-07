@@ -590,12 +590,10 @@ const VALIDATION_REPLICAS = parseInt(A.validation_replicas != null ? A.validatio
 // against — and the cheap one: isolated validation is 6-12 cold boots serialized behind the
 // serving-GPU flock, enough to overrun FINAL_RESERVE_MS and ship no validated number at all.
 const VALIDATION_MEASUREMENT_MODE = String(A.validation_measurement_mode || 'warm_server');
-const VALIDATION_ROUNDS = parseInt(A.validation_rounds != null ? A.validation_rounds : 1, 10);
-const VALIDATION_SAMPLES = VALIDATION_MEASUREMENT_MODE === 'warm_server'
-  ? VALIDATION_ROUNDS : VALIDATION_REPLICAS;
-// Too little clock left for a multi-sample re-measure: fall back to one timed round per leg. The
-// ratio stays drift-corrected, only the dispersion test is lost, and one number beats no number.
-const VALIDATION_TIGHT_MS = parseInt(A.validation_tight_s != null ? A.validation_tight_s : 1500, 10) * 1000;
+// Sample count follows the mode rather than a knob of its own: warm_server IS one timed round per
+// leg, and a second knob could only disagree with the lifecycle it belongs to. Going isolated is
+// what buys extra samples, and it already has `validation_replicas` to size them.
+const VALIDATION_SAMPLES = VALIDATION_MEASUREMENT_MODE === 'warm_server' ? 1 : VALIDATION_REPLICAS;
 // CUDA/HIP-graph deployment requirement (general; derived from the serving config, NOT hardcoded).
 // vllm/sglang capture the steady-state decode path into a FULL CUDA graph UNLESS --enforce-eager is set.
 // A kernel that wins only via its OWN per-call graph-capture+replay wrapper falls back to eager inside the
@@ -4584,14 +4582,6 @@ if (want('final')) {
   // bounded — Report already wrote architect_report.md + final_report.md, and run_e2e.py falls back
   // (director_e2e_validation.json → best overlay's integrate_result.json), so a real win still reaches the caller.
   phase('Validate');
-  let validationSamples = VALIDATION_SAMPLES;
-  if (TIME_BUDGET_MS != null && remainingMs() < VALIDATION_TIGHT_MS && validationSamples > 1) {
-    log(`[time-budget] only ~${remainingMin()}min left entering Validate — dropping to 1 timed ` +
-        `sample per leg (from ${validationSamples}). The ratio stays drift-corrected and ` +
-        `same-session; the non-overlap dispersion test is forfeited, so a marginal win can only ` +
-        `be reported as within-noise.`);
-    validationSamples = 1;
-  }
   validation = await safeAgent(
     roleAgent('director', 'validate', 'Independently re-measure throughput + parity; arbitrate; then reconcile the report with the validated numbers.', {
       EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], BASELINE_THROUGHPUT: BASELINE_TPUT, NOISE_BAND_PCT: NOISE_BAND,
@@ -4600,7 +4590,7 @@ if (want('final')) {
       FINAL_FLAGS: { flags: curFlags, env: curEnv },
       CLAIMED_THROUGHPUT: finalTput, WORKLOAD, APPLY_TO_ORIGINAL,
       MEASUREMENT_MODE: VALIDATION_MEASUREMENT_MODE,
-      MEASUREMENT_PURPOSE: 'validation', REPLICAS: validationSamples,
+      MEASUREMENT_PURPOSE: 'validation', REPLICAS: VALIDATION_SAMPLES,
       SKILL_DIR: WORKFLOW_DIR,
       // The Report phase already wrote these files with the Finalize-bundle bench (the Director had not
       // run yet). After validation the Director MUST review + rewrite their headline throughput / speedup

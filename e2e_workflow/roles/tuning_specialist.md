@@ -93,10 +93,9 @@ Everything else is your call. These four are not:
    default `warm_server` gives each leg one server, a discarded full warmup round, then the timed
    round(s) on that hot server — the same lifecycle the baseline and the final validation use, so your
    delta is comparable to theirs. A post-only number is not a result.
-4. **Prove engagement before you claim anything**, and quote the evidence. An unproven artifact is not a
-   win here regardless of what the timing said — the orchestrator will refuse the accept without it, and
-   an unproven artifact silently poisons every later A/B in the run, since your accepted config becomes
-   their reference leg.
+4. **Prove engagement before you claim anything**, and quote the evidence. Whatever the timing said,
+   the orchestrator refuses an accept without it — and an unproven artifact poisons every later A/B,
+   since your accepted config becomes their reference leg.
 
 Correctness: apply the skillset's gates, plus the task-accuracy gate when `ACCURACY_GATE` is on. A
 faster wrong server is a regression.
