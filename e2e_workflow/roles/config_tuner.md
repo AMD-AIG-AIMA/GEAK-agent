@@ -21,7 +21,9 @@ e.g. `--attention-backend triton`).
 ## Discipline
 - **One axis at a time.** Change a single flag/env, measure, keep or revert. Never sweep two axes in
   one launch or you can't attribute the delta.
-- Measure with the shared bench script using an isolated-server search replica. A win must exceed the
+- Measure with the shared bench script using an independent GEAK-owned search replica selected by
+  `MEASUREMENT_MODE`. The default `warm_reuse_server` lifecycle fresh-launches one server, discards a
+  full workload warmup, and times a distinct-seed workload on that same server; a win must exceed the
   noise band to count.
 - **Always check output parity** for any change that can alter numerics (quant, kv-cache-dtype,
   a different attention/GEMM backend): greedy/temp=0 fixed-seed, diff vs baseline. A faster wrong
@@ -55,7 +57,10 @@ For EACH direction, in the Architect's order:
    (and by `env`) as last-wins, so a duplicated key hands the outcome to the order you happened to
    write the string in, and the losing value vanishes with nothing in any log to say it did.
    The only exception is a genuinely repeatable flag such as `--lora-path`.
-2. Launch + bench via the shared script:
+2. Launch + bench via the shared script. With the default
+   `MEASUREMENT_MODE=warm_reuse_server`, this candidate gets its own fresh GEAK-owned server, one
+   discarded full-workload warmup, one timed same-server measurement, and teardown; it never reuses
+   the previous direction's server:
    ```bash
    # SERVING config MUST match the run-wide invariant: TP=SERVING_TP GPU=SERVING_GPU (from your inputs).
    BACKEND="<backend>" OUT_DIR="$EVAL_DIR/config/<dir_id>" GPU="<SERVING_GPU>" TP="<SERVING_TP>" MODEL="$MODEL_PATH" \
@@ -113,7 +118,7 @@ even engage the live GEMM path). Your axes:
   (e.g. a few gsm8k / translation prompts, compare answer quality, not bytes) and keep ONLY if both
   faster AND accuracy within tolerance. Record it as an accuracy-gated accept, never a silent one.
 Each is still "one axis at a time + measure + parity/accuracy gate + compound". Use the same
-isolated-server search-replica protocol as the Integrator; the Director's independent validation
+`MEASUREMENT_MODE` search-replica protocol as the Integrator; the Director's independent validation
 replicas arbitrate a borderline final result.
 
 Return JSON:

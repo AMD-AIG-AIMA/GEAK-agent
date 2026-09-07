@@ -89,9 +89,10 @@ Everything else is your call. These four are not:
 2. **Measure your own pre-tune baseline in-session.** Do not inherit `CURRENT_THROUGHPUT` as your
    denominator — re-measure it on the current accepted config and `CURRENT_OVERLAY`, now. Your delta is
    `post` vs `your own pre`, and it is the whole reason this phase is separate.
-3. **Measure pre/post as isolated-server search replicas**, and complete both legs — each retaining
-   internal warmups, skipping the outer full-round replay, recording one cache-cold request set. A
-   post-only number is not a result.
+3. **Measure pre/post as independent `MEASUREMENT_MODE` search replicas**, and complete both legs.
+   With the default `warm_reuse_server` mode, each leg owns a fresh GEAK-owned server, discards one
+   full-workload seed-0 warmup, retains its internal `2*CONC` kernel/graph warmups, records one
+   seed-1 timed request set on that same server, then tears down. A post-only number is not a result.
 4. **Prove engagement before you claim anything**, and quote the evidence. Whatever the timing said,
    the orchestrator refuses an accept without it — and an unproven artifact poisons every later A/B,
    since your accepted config becomes their reference leg.
@@ -157,7 +158,7 @@ without asking you a question.
 
 Write `EVAL_DIR/tuning/tuning_report.md`: what you targeted and why, per attempt what you changed and
 what it measured (including the failures — an explained dead end saves the next person from repeating
-it), the correctness and engagement evidence, and the isolated-server A/B. The System Architect quotes
+it), the correctness and engagement evidence, and the independent replica A/B. The System Architect quotes
 this in the final report, so put real numbers in it and mark absent things as absent.
 
 ### Return JSON

@@ -734,8 +734,9 @@ const KB_RESOLVE_SCHEMA = obj({
   // 'speedup' would mis-explain the order it is looking at.
   sorted_by: { type: 'string' }, champion_metric: { type: 'string' },
 }, []);
-// Result of the standalone tuning-skillset phase. pre/post are ITS OWN in-session isolated-server A/B
-// legs (NOT the run baseline), which makes tuning_delta_pct an attributable share of the total gain.
+// Result of the standalone tuning-skillset phase. pre/post are ITS OWN in-session independent
+// MEASUREMENT_MODE A/B legs (NOT the run baseline), which makes tuning_delta_pct an attributable share
+// of the total gain.
 // engagement_verified is load-bearing: the skillset's own thesis is that an unproven artifact is not a
 // win, so the orchestrator refuses to bank an accept without it.
 const TUNING_SCHEMA = obj({
@@ -2314,7 +2315,7 @@ if (want('setup')) {
 
         let sweep = await runValidation(
           'Validate ONE historical configuration recovered from the knowledge base. Treat it exactly ' +
-          'as you would a fresh direction: same isolated-server measurement, same parity check, same ' +
+          'as you would a fresh direction: same independent MEASUREMENT_MODE measurement, same parity check, same ' +
           'swap-took-effect verification. THREE deviations from your role file, all deliberate:\n' +
           '(1) Do NOT decompose this direction into one-axis-at-a-time trials. A stored config is an ' +
           'ALREADY-COMPOUNDED whole that was accepted together on another box; benching its knobs ' +
@@ -2540,7 +2541,7 @@ if (want('setup')) {
         };
         const integ = await runIntegrateBothLegs(
           'Overlay a kernel RECOVERED FROM THE KNOWLEDGE BASE and gate it on e2e throughput. Run your ' +
-          'normal isolated-server A/B — same fresh-server legs, same parity probe. Two things are different ' +
+          'normal independent MEASUREMENT_MODE A/B — same fresh-server legs, same parity probe. Two things are different ' +
           'and you must honour both:\n' +
           (viaOverlay
             ? '(0) DO NOT BUILD THE CANDIDATE OVERLAY. This kernel was authored by another run, whose ' +
@@ -3010,7 +3011,7 @@ function gemmSynthFor(h) { return (h && h.op_kind === 'moe') ? 'false' : GEMM_SY
 //     tuning, and every head A/B measures against a reference leg that already contains the tuning.
 //   * STANDALONE, because a tuning loop folded into the head bake-off never runs to completion (it
 //     collapses into "one more candidate config") and its contribution becomes unattributable. With its
-//     own in-session pre/post isolated-server A/B, the final report can state tuning's share of the gain.
+//     own in-session pre/post independent-replica A/B, the final report can state tuning's share of the gain.
 //
 // An accept is folded into curFlags/curEnv (the deploy's required env IS the engagement mechanism), then
 // the profile is re-taken exactly as it is after a config win, because tuning changes the landscape too.
@@ -3022,7 +3023,7 @@ if (want('tune') && TUNING_SKILLSET_ENABLED) {
     `no op cap, tuning-kb ${TUNING_KB_ENABLED ? 'ENABLED' : 'DISABLED (blind eval)'}.`);
   tuning = await safeAgent(
     roleAgent('tuning_specialist', 'tune',
-      'Tune the live stack with the skillset, measure your OWN in-session isolated-server pre/post A/B, ' +
+      'Tune the live stack with the skillset, measure your OWN in-session MEASUREMENT_MODE pre/post A/B, ' +
       'prove engagement, and hand back a deploy bundle that reaches production through EVAL_DIR/final/.', {
       EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], WORKLOAD,
       BASELINE_THROUGHPUT: BASELINE_TPUT, CURRENT_THROUGHPUT: curTput,
