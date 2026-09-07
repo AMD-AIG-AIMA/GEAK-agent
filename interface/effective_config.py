@@ -51,7 +51,9 @@ class _Flag:
     value: Optional[str]
 
 
-def _protect_bare_json(text: str) -> tuple[str, dict[str, str]]:
+def _protect_bare_json(
+    text: str, *, canonicalize_json: bool = True
+) -> tuple[str, dict[str, str]]:
     """Replace balanced bare JSON values before POSIX ``shlex`` removes quotes."""
 
     protected: dict[str, str] = {}
@@ -102,21 +104,24 @@ def _protect_bare_json(text: str) -> tuple[str, dict[str, str]]:
             i += 1
             continue
         token = f"__GEAK_JSON_{len(protected)}__"
-        protected[token] = json.dumps(
-            parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        protected[token] = (
+            json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            if canonicalize_json else candidate
         )
         out.append(token)
         i = end
     return "".join(out), protected
 
 
-def _shell_tokens(text: Any) -> list[str]:
-    """Split shell text while retaining and canonicalising bare JSON values."""
+def _shell_tokens(text: Any, *, canonicalize_json: bool = True) -> list[str]:
+    """Split shell text while protecting bare JSON values."""
 
     rendered = str(text or "").strip()
     if not rendered:
         return []
-    protected_text, protected = _protect_bare_json(rendered)
+    protected_text, protected = _protect_bare_json(
+        rendered, canonicalize_json=canonicalize_json
+    )
     tokens = shlex.split(protected_text, posix=True)
     for index, token in enumerate(tokens):
         for marker, value in protected.items():
@@ -197,7 +202,8 @@ def _parse_env(value: Any) -> "OrderedDict[str, str]":
     if isinstance(value, Mapping):
         return OrderedDict((str(key), str(item)) for key, item in value.items())
     result: "OrderedDict[str, str]" = OrderedDict()
-    for token in _shell_tokens(value):
+    # Environment values are opaque strings, including any embedded JSON text.
+    for token in _shell_tokens(value, canonicalize_json=False):
         key, separator, item = token.partition("=")
         if not separator or not key:
             raise ValueError(f"environment entry must be KEY=VALUE: {token!r}")

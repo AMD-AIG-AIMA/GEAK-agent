@@ -217,6 +217,40 @@ def test_conflicting_extra_and_accepted_env_raises(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("quoting", ["bare", "assignment", "value"])
+@pytest.mark.parametrize("value", [
+    '{"b": 2, "a": 1}',
+    '["second", "first"]',
+    '{"scale": 1.00}',
+    '{ "label": "caf\u00e9" }',
+])
+def test_json_environment_values_roundtrip_without_normalization(
+    tmp_path: Path, value: str, quoting: str
+) -> None:
+    token = f"CONFIG={value}"
+    if quoting == "assignment":
+        token = shlex.quote(token)
+    elif quoting == "value":
+        token = f"CONFIG={shlex.quote(value)}"
+    result = resolve_effective_config(_handoff(
+        _recipe(tmp_path, "vllm", ""),
+        extra_envs={"CONFIG": value},
+        accepted_env=token,
+    ))
+
+    assert result.final_env["CONFIG"] == value
+    assert result.conflicts == []
+
+
+def test_distinct_json_environment_strings_still_conflict(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="conflicting environment variable.*CONFIG"):
+        resolve_effective_config(_handoff(
+            _recipe(tmp_path, "vllm", ""),
+            extra_envs={"CONFIG": '{"scale":1.0}'},
+            accepted_env=shlex.quote('CONFIG={"scale":1.00}'),
+        ))
+
+
 def test_manifest_digest_and_dict_are_deterministic(tmp_path: Path) -> None:
     recipe = _recipe(tmp_path, "vllm", "--dtype auto", A="1")
     first = resolve_effective_config(_handoff(recipe))
