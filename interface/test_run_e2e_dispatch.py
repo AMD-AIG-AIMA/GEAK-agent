@@ -270,6 +270,19 @@ class TestMapArgs(_RunE2ECase):
         )
         self.assertNotIn("time_budget_s", ps_zero)
 
+    def test_tuning_request_presence_survives_handoff_mapping(self):
+        # Omission permits budget-aware head priority; explicit true requests tuning first.
+        for supplied, expected in (({}, None), ({"tuning_skillset": True}, "true"),
+                                   ({"tuning_skillset": "true"}, "true"),
+                                   ({"tuning_skillset": False}, "false")):
+            with self.subTest(supplied=supplied):
+                ps = rx.map_args(self._handoff(**supplied), timeout_s=15942)
+                self.assertEqual(ps["time_budget_s"], 15942)
+                if expected is None:
+                    self.assertNotIn("tuning_skillset", ps)
+                else:
+                    self.assertEqual(ps["tuning_skillset"], expected)
+
     def test_unparseable_fidelity_knobs_are_dropped_not_raised(self):
         """A junk max_model_len/mem_fraction must degrade to the adapter default,
         never abort the run before it starts."""

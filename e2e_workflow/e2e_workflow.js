@@ -3014,7 +3014,19 @@ function gemmSynthFor(h) { return (h && h.op_kind === 'moe') ? 'false' : GEMM_SY
 // the profile is re-taken exactly as it is after a config win, because tuning changes the landscape too.
 // ===========================================================================
 let tuning = ST.tuning || null;
-if (want('tune') && TUNING_SKILLSET_ENABLED) {
+// A finite runner budget cannot reserve generation time by merely racing an unbounded tuning
+// worker against a timer: the worker may still be running. When tuning was only the implicit
+// default, give already-queued head work priority by never starting that optional worker.
+// An explicit tuning_skillset=true requests the existing tune-then-head path; tune-only and
+// unbudgeted invocations keep it too. A carried accepted tuning result is never discarded.
+const tuningAdmissionSkip = A.tuning_skillset == null && TUNING_SKILLSET_ENABLED &&
+  want('tune') && want('head') && headQueue.length > 0 && HEAD_BUDGET > 0 &&
+  Number.isFinite(TIME_BUDGET_MS) && TIME_BUDGET_MS > 0
+  ? { reason: 'implicit_tuning_skipped_for_head_generation',
+      queued_heads: headQueue.length, elapsed_ms: ELAPSED_MS,
+      head_dispatch_deadline_ms: TIME_HEAD_DEADLINE_MS }
+  : null;
+if (want('tune') && TUNING_SKILLSET_ENABLED && !tuningAdmissionSkip) {
   phase('TuningSkillset');
   log(`Tuning skillset: ${TUNING_SKILLSET_DIR} (whole, standalone, pre-HeadKernel); ` +
     `no op cap, tuning-kb ${TUNING_KB_ENABLED ? 'ENABLED' : 'DISABLED (blind eval)'}.`);
@@ -3264,12 +3276,20 @@ if (want('tune') && TUNING_SKILLSET_ENABLED) {
     history.ledger.push({ direction: 'tuning_skillset', verdict: tuning && tuning.gate === 'skipped' ? 'skipped' : 'dead_end',
       lesson: (tuning && (tuning.reason || tuning.summary)) || 'tuning phase produced no result' });
   }
+} else if (tuningAdmissionSkip) {
+  log(`[budget] skipping implicit TuningSkillset before ${headQueue.length} queued head(s); ` +
+    'no tuning worker started. Set tuning_skillset=true to request tune-then-head explicitly.');
+  history.ledger.push({ direction: 'tuning_skillset', verdict: 'skipped',
+    lesson: tuningAdmissionSkip.reason, ...tuningAdmissionSkip });
 } else if (want('tune') && !TUNING_SKILLSET_ENABLED) {
   log('Tuning skillset DISABLED (tuning_skillset=false) — skipping the phase entirely.');
 }
 // Report inputs for the tuning phase. Empty object when the phase is off/absent, so the Report prompt is
 // byte-identical to a build without this feature.
-const TUNING_REPORT_INPUTS = (TUNING_SKILLSET_ENABLED && tuning) ? { TUNING_RESULT: tuning } : {};
+const TUNING_REPORT_INPUTS = {
+  ...((TUNING_SKILLSET_ENABLED && tuning) ? { TUNING_RESULT: tuning } : {}),
+  ...(tuningAdmissionSkip ? { TUNING_ADMISSION_SKIP: tuningAdmissionSkip } : {}),
+};
 // Finalize inputs. A tuned DATA artifact cannot ride the PYTHONPATH overlay, so the ONLY way it reaches
 // production is for Finalize to fold this bundle into EVAL_DIR/final/ (concatenate its diff into
 // final_patch.diff, copy its files, and invoke its deploy.sh from final_launch.sh before the server
@@ -4678,7 +4698,10 @@ function tuningReturn() {
   if (!TUNING_SKILLSET_ENABLED) return { enabled: false };
   const base = {
     enabled: true, skillset_dir: TUNING_SKILLSET_DIR, kb_enabled: TUNING_KB_ENABLED, ran: !!tuning,
+    ...(tuningAdmissionSkip ? { admission_skip: tuningAdmissionSkip } : {}),
   };
+  if (!tuning && tuningAdmissionSkip)
+    return { ...base, gate: 'skipped', reason: tuningAdmissionSkip.reason };
   if (!tuning) return { ...base, gate: want('tune') ? 'not_run' : 'phase_not_selected' };
   const finalT = validatedOk ? validation.director_verified_throughput_tok_s : finalTput;
   const totalGain = (finalT || 0) - (BASELINE_TPUT || 0);

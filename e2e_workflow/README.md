@@ -148,12 +148,24 @@ achievable number (it is broader = more backends, deeper = more/faster rounds, p
 spare GPUs while the e2e gate runs on the serving slot, with matched in-window A/B so parallelism never
 corrupts a measurement).
 
-## Tuning skillset (`tuning_skillset`, default ON)
+## Tuning skillset (`tuning_skillset`)
 
 A dedicated phase — **after ConfigSweep, before HeadKernel** — that runs the tuning skillset vendored at
 `<repo>/perf_knowledge/expert_skills/tuning/`: an independently-validated method for tuning GPU ops on AMD Instinct (per-op
 tuners, deploy paths into a live server, and the engagement checks that prove a tuned artifact is
 actually what the machine runs).
+
+With a finite external `time_budget_s`, an invocation that has pending HeadKernel work skips
+implicitly enabled tuning before starting a tuning worker. This prevents the optional phase from
+consuming the head-dispatch window. Set `tuning_skillset:true` explicitly to request the existing
+tune-then-head path, or drive the tuning and head phases separately with their carried state.
+Tune-only, unbudgeted, and no-pending-head invocations keep the existing default. Previously accepted
+tuning state and its deploy bundle remain available when a new tuning attempt is skipped.
+
+The skip is recorded as `implicit_tuning_skipped_for_head_generation` in the ledger and tuning result.
+This is phase admission, not worker cancellation or a guarantee that profiling, capture, authoring,
+or final validation will finish within the budget. No duration estimate is used to admit an unbounded
+tuning worker, and the existing dispatch and final-reserve deadlines remain unchanged.
 
 **It is vendored whole and run whole.** The tree is byte-identical to the standalone repo it is validated
 in (37 executable claims in `validate/claims.py`), hash-pinned by

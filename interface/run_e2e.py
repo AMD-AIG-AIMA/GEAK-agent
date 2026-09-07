@@ -406,8 +406,9 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
     # config_tune sweep disabled above: Hyperloom's EXPLORE searched server
     # flags/env, whereas this phase runs the vendored tuning skillset's own loop
     # (per-op tuners -> tuned artifacts -> engagement proof), which upstream did
-    # not do. So it stays enabled by default and is only overridden on request.
-    # Omitted keys => the workflow's own defaults, byte-identical to a direct call.
+    # not do. Preserve whether the caller explicitly requested it: budgeted workflows
+    # give pending head generation priority over tuning enabled only by default.
+    # An explicit true retains tune-then-head; omitted keys use workflow admission.
     if h.get("tuning_skillset") is not None:
         ps_args["tuning_skillset"] = "true" if _as_bool(h["tuning_skillset"]) else "false"
     # tuning-kb is the skillset's per-model ANSWER KEY: right for production, but it
@@ -2775,6 +2776,8 @@ def _tuning_skillset_section(wf: dict, eval_dir: Path) -> dict | None:
     t = wf.get("tuning_skillset")
     if not isinstance(t, dict) or not t.get("enabled"):
         return None
+    admission = t.get("admission_skip")
+    admission_fields = {"admission_skip": dict(admission)} if isinstance(admission, dict) else {}
     if not t.get("ran"):
         # Enabled but never executed (e.g. a phase-scoped invocation that skipped it). Record that
         # plainly rather than implying a measured no-win.
@@ -2782,7 +2785,12 @@ def _tuning_skillset_section(wf: dict, eval_dir: Path) -> dict | None:
             "phase": "TuningSkillset",
             "ran": False,
             "gate": t.get("gate") or "not_run",
-            "explanation": "The standalone tuning-skillset phase was enabled but did not run in this invocation.",
+            "explanation": (
+                "Implicit tuning was skipped to prioritize queued head generation; no tuning worker was started."
+                if admission_fields else
+                "The standalone tuning-skillset phase was enabled but did not run in this invocation."
+            ),
+            **admission_fields,
         }
 
     gate = t.get("gate") or "unknown"
@@ -2811,6 +2819,7 @@ def _tuning_skillset_section(wf: dict, eval_dir: Path) -> dict | None:
     section: dict[str, Any] = {
         "phase": "TuningSkillset",
         "ran": True,
+        **admission_fields,
         "gate": gate,
         "explanation": explanation,
         "mode": t.get("mode") or "",

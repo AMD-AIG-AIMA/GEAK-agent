@@ -127,7 +127,7 @@ if (phaseList) {
 // Source order is what actually runs — assert the gated blocks are in the same sequence.
 const at = (re) => src.search(re);
 const iConfig = at(/if \(want\('config'\)/);
-const iTune = at(/if \(want\('tune'\) && TUNING_SKILLSET_ENABLED\)/);
+const iTune = at(/if \(want\('tune'\) && TUNING_SKILLSET_ENABLED && !tuningAdmissionSkip\)/);
 const iHead = at(/if \(want\('head'\)/);
 ok(iTune > 0, "a gated `want('tune')` block exists");
 ok(iConfig > 0 && iConfig < iTune, 'the tune block runs AFTER the ConfigSweep block');
@@ -214,8 +214,15 @@ if (gate) {
 // The tuning loop is uncapped by design: tuning ops are cheap and cumulative, unlike head ops.
 ok(!/TUNING_BUDGET/.test(src), 'no op budget caps the tuning loop');
 // The report inputs must be an EMPTY spread when off, so the Report prompt is unchanged.
-ok(/const TUNING_REPORT_INPUTS = \(TUNING_SKILLSET_ENABLED && tuning\) \? \{ TUNING_RESULT: tuning \} : \{\};/.test(src),
+{
+  const start = src.indexOf('const TUNING_REPORT_INPUTS =');
+  const end = src.indexOf('// Finalize inputs.', start);
+  const reportInputsFor = new Function('TUNING_SKILLSET_ENABLED', 'tuning', 'tuningAdmissionSkip',
+    src.slice(start, end) + '\nreturn TUNING_REPORT_INPUTS;');
+  ok(JSON.stringify(reportInputsFor(false, null, null)) === '{}' &&
+    JSON.stringify(reportInputsFor(true, null, null)) === '{}',
   'report inputs are an empty object when the phase is off/absent (Report prompt byte-identical)');
+}
 ok((src.match(/\.\.\.TUNING_REPORT_INPUTS/g) || []).length === 1,
   'the report spread appears exactly once (Report phase only)');
 // Fast mode's contract is HeadKernel-only, so 'tune' must join its skip set.
@@ -341,6 +348,12 @@ ok(/Prior tuning knowledge/.test(role) && /KB_REFERENCE_DIR/.test(role),
   'the role file tells the specialist to check the KB before searching');
 ok(/prove engagement/i.test(role) && /A recall is not an accept/.test(role),
   'a recalled artifact still has to earn its accept on this box');
+
+// Keep the executed scheduling regression in the existing L0 entry point.
+try {
+  require('child_process').execFileSync(process.execPath,
+    [path.join(__dirname, 'test_tuning_head_admission.js')], { stdio: 'inherit' });
+} catch (_) { failures++; }
 
 console.log(failures === 0
   ? '\nPASS: tuning skillset is vendored whole and runs standalone before HeadKernel.'

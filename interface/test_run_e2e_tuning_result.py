@@ -94,6 +94,27 @@ def test_absent_when_phase_disabled(tmp_path):
     assert "tuning_skillset" not in out
 
 
+def test_generation_admission_skip_survives_result_normalization(tmp_path):
+    admission = {"reason": "implicit_tuning_skipped_for_head_generation", "queued_heads": 2}
+    t = _norm(tmp_path, _wf(tuning_skillset={
+        "enabled": True, "ran": False, "gate": "skipped", "admission_skip": admission,
+    }))["tuning_skillset"]
+    assert t["ran"] is False
+    assert t["gate"] == "skipped"
+    assert t["admission_skip"] == admission
+    assert "no tuning worker was started" in t["explanation"]
+    assert "reaches_production_via" not in t
+
+
+def test_carried_tuning_accept_survives_skipping_a_new_attempt(tmp_path):
+    admission = {"reason": "implicit_tuning_skipped_for_head_generation", "queued_heads": 1}
+    t = _norm(tmp_path, _wf(tuning_skillset=_tuning(admission_skip=admission)))["tuning_skillset"]
+    assert t["gate"] == "accepted"
+    assert t["admission_skip"] == admission
+    assert t["deploy_bundle"] == "/eval/tuning/deploy"
+    assert t["apply_overlay"] == "/eval/tuning/overlay"
+
+
 # --------------------------------------------------------------------------- additivity
 
 
