@@ -288,10 +288,9 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
     if int(h.get("schema_version", 1) or 1) >= 2 and isinstance(
         h.get("baseline_env_spec"), dict
     ):
-        # Schema-v2 is authoritative: launch_recipe < complete resolved
-        # server_launch_flags < reconciled current-best delta.  The resolver
-        # canonicalises flag spellings so a key appears once and refuses
-        # contradictory extra_server_args vs accepted_flags/env.
+        # Schema-v2 uses complete server_launch_flags when available, otherwise
+        # recipe args, then the reconciled current-best delta. The resolver
+        # canonicalises flags and refuses contradictory extra/accepted values.
         effective = resolve_effective_config(h)
     initial_server_args = (
         effective.final_server_args
@@ -1205,11 +1204,9 @@ def apply_bench_launcher(h: dict) -> str:
     if int(h.get("schema_version", 1) or 1) >= 2 and isinstance(
         h.get("baseline_env_spec"), dict
     ):
-        # initial_extra_server_args was resolved from the COMPLETE server argv,
-        # including the recipe layer.  Tell the Magpie adapter not to prepend
-        # its recipe EXTRA_<BACKEND>_ARGS a second time. This remains true when
-        # server_launch_flags is empty: the resolver still folded recipe args
-        # into the canonical result.
+        # The resolver selected the complete server argv or its recipe fallback.
+        # Tell Magpie not to prepend recipe EXTRA_<BACKEND>_ARGS again, which
+        # could restore flags intentionally absent from the complete argv.
         os.environ["EFFECTIVE_SERVER_ARGS_COMPLETE"] = "1"
     else:
         os.environ.pop("EFFECTIVE_SERVER_ARGS_COMPLETE", None)

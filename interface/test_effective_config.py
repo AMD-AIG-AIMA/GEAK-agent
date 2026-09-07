@@ -95,7 +95,7 @@ def test_deduplicates_identical_flag_across_all_sources(tmp_path: Path) -> None:
     assert result.conflicts == []
 
 
-def test_precedence_overrides_and_preserves_unknown_flags(tmp_path: Path) -> None:
+def test_complete_launch_replaces_recipe_and_preserves_unknown_flags(tmp_path: Path) -> None:
     recipe = _recipe(tmp_path, "vllm", "--block-size 8 --recipe-only")
     result = resolve_effective_config(
         _handoff(
@@ -109,12 +109,11 @@ def test_precedence_overrides_and_preserves_unknown_flags(tmp_path: Path) -> Non
     tokens = shlex.split(result.final_server_args)
     assert tokens.count("--block-size") == 1
     assert tokens[tokens.index("--block-size") + 1] == "32"
-    assert "--recipe-only" in tokens
+    assert "--recipe-only" not in tokens
     assert "--unknown-launch" in tokens
     assert "--delta-only" in tokens
     assert "--accepted-only" in tokens
     assert [entry["higher_source"] for entry in result.conflicts] == [
-        "server_launch_flags",
         "current_best_delta",
     ]
 

@@ -296,9 +296,10 @@ def resolve_effective_config(
 ) -> EffectiveConfig:
     """Resolve a handoff into one canonical argument string and environment.
 
-    For schema v2 the precedence is recipe, then ``server_launch_flags``, then
-    the reconciled current-best delta.  Schema v1 remains a legacy pass-through:
-    only its top-level accepted values are represented.
+    For schema v2 a nonempty ``server_launch_flags`` is the complete argument
+    base; the recipe supplies arguments only when that snapshot is unavailable.
+    The reconciled current-best delta overrides this base. Recipe environment
+    values remain available in either case. Schema v1 is a legacy pass-through.
     """
 
     data = _load_handoff(handoff)
@@ -329,8 +330,11 @@ def resolve_effective_config(
             backend_args = raw_recipe_env.get(backend_arg_name, "")
             recipe_args = " ".join(part for part in (recipe_args, backend_args) if part)
 
-        recipe_flags = _flag_map(recipe_args)
         launch_flags = _flag_map(baseline_config.get("server_launch_flags", ""))
+        # A complete argv records removals by absence. Merging recipe-only flags
+        # would restore options the caller removed from its best configuration.
+        # Empty launch flags mean unavailable evidence in existing handoffs.
+        recipe_flags = _flag_map(recipe_args) if not launch_flags else OrderedDict()
         extra_flags = _flag_map(baseline_config.get("extra_server_args", ""))
         accepted_flags = _flag_map(data.get("accepted_flags", ""))
         delta_flags = _reconcile(
