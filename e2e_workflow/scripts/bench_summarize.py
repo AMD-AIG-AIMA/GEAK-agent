@@ -171,7 +171,8 @@ def from_replicas(args):
         with open(path) as fh:
             summaries.append(json.load(fh))
         try:
-            attempt = int(open(os.path.join(rdir, "selected_attempt")).read().strip())
+            with open(os.path.join(rdir, "selected_attempt")) as fh:
+                attempt = int(fh.read().strip())
         except (OSError, ValueError):
             attempt = None
         replicas.append({"replica": index, "attempt": attempt,

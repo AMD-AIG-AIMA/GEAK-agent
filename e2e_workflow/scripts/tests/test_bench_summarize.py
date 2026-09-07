@@ -9,6 +9,9 @@ reads their output -- the director's validate step, the integrator's A/B, the or
 handoff -- so a renamed key or a status that says "complete" on a short round is a wrong
 accept, not a crash. The keys and the E2E_SUMMARY line are therefore pinned here.
 """
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -19,19 +22,46 @@ import unittest
 SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SUMMARIZE = os.path.join(SCRIPTS_DIR, "bench_summarize.py")
 
+#: Env this module reads. Scrubbed before every call so a caller's shell cannot change
+#: what a test measures; `env=` re-adds the ones a test is actually about.
+_LIFECYCLE_ENV = ("E2E_METRIC", "WARM_SERVER_ROUNDS", "GEAK_ISOLATED_REPLICA",
+                  "MEASUREMENT_PURPOSE", "EFFECTIVE_CONFIG_DIGEST")
+
+
+def _load_summarize():
+    spec = importlib.util.spec_from_file_location("bench_summarize", SUMMARIZE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+summarizer = _load_summarize()
+
 
 def _run(args, env=None):
-    e = dict(os.environ)
-    e.pop("E2E_METRIC", None)
-    e.pop("WARM_SERVER_ROUNDS", None)
-    e.pop("GEAK_ISOLATED_REPLICA", None)
-    e.pop("MEASUREMENT_PURPOSE", None)
-    e.pop("EFFECTIVE_CONFIG_DIGEST", None)
-    e.update(env or {})
-    proc = subprocess.run([sys.executable, SUMMARIZE] + args,
-                          env=e, capture_output=True, text=True, timeout=60)
-    assert proc.returncode == 0, proc.stderr
-    return proc.stdout.strip()
+    """Drive the CLI in-process and return its stdout.
+
+    A subprocess reports as zero measured coverage even when every branch runs, which
+    under the repo's coverage gate is indistinguishable from a script nobody tested.
+    ``main()`` already takes argv, so nothing about the CLI contract needs a fork;
+    CliEntrypointTest keeps one real process for what only a process has.
+    """
+    overrides = dict(env or {})
+    saved = {name: os.environ.get(name) for name in set(_LIFECYCLE_ENV) | set(overrides)}
+    stdout = io.StringIO()
+    try:
+        for name in _LIFECYCLE_ENV:
+            os.environ.pop(name, None)
+        os.environ.update(overrides)
+        with contextlib.redirect_stdout(stdout):
+            summarizer.main(args)
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    return stdout.getvalue().strip()
 
 
 class FromRunsTest(unittest.TestCase):
@@ -88,6 +118,15 @@ class FromRunsTest(unittest.TestCase):
         self.assertIsNone(s["output_throughput_tok_s_median"])
         self.assertIsNone(s["output_throughput_tok_s_spread_pct"])
         self.assertIn("aggregate_total_token_tok_s=945.0", line)
+
+    def test_a_missing_cold_file_does_not_abort_the_summary(self):
+        """The cold round is discarded evidence; losing it must not cost the timed rounds."""
+        self.write_runs(self.runs, [100.0, 110.0])
+        _run(["from-runs", self.runs, self.out, os.path.join(self.tmp, "absent.jsonl")])
+        with open(self.out, encoding="utf-8") as fh:
+            s = json.load(fh)
+        self.assertEqual(s["throughput_tok_s_median"], 105.0)
+        self.assertEqual(s["cold_runs"], 0)
 
     def test_cold_round_is_separate_and_absent_by_default(self):
         s, _ = self.summarize([100.0, 110.0])
@@ -244,6 +283,43 @@ class ContractParityTest(unittest.TestCase):
         for k in ("status", "usable_for_acceptance", "observed_median",
                   "requested_replicas", "successful_replicas"):
             self.assertEqual(warm[k], iso[k], "%s disagrees between lifecycles" % k)
+
+
+class CliEntrypointTest(unittest.TestCase):
+    """The one place a real process is required.
+
+    Every other test drives ``main(argv)`` directly. That covers the parsing and the
+    emitters, but not the two things `bench_e2e.sh` actually depends on: that running the
+    file as a program works at all, and that a bad invocation exits non-zero instead of
+    writing a `bench_summary.json` nobody asked for.
+    """
+
+    def _spawn(self, args):
+        env = dict(os.environ)
+        for name in _LIFECYCLE_ENV:
+            env.pop(name, None)
+        return subprocess.run([sys.executable, SUMMARIZE] + args,
+                              env=env, capture_output=True, text=True, timeout=60)
+
+    def test_running_the_file_as_a_program_emits_the_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = os.path.join(tmp, "bench_runs.jsonl")
+            with open(runs, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"output_throughput": 100.0,
+                                     "total_token_throughput": 900.0,
+                                     "median_ttft_ms": 40.0,
+                                     "median_tpot_ms": 8.0}) + "\n")
+            out = os.path.join(tmp, "bench_summary.json")
+            proc = self._spawn(["from-runs", runs, out])
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("E2E_SUMMARY", proc.stdout)
+            self.assertTrue(os.path.exists(out))
+
+    def test_an_unusable_invocation_exits_non_zero(self):
+        proc = self._spawn(["no-such-subcommand"])
+
+        self.assertNotEqual(proc.returncode, 0)
 
 
 if __name__ == "__main__":
