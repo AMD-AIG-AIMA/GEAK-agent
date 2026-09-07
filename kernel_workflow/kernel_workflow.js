@@ -187,7 +187,8 @@ async function agentT(p, o) {
 function expertSkillsBlock(role) {
   if (!USE_EXPERT_SKILLS || !EXPERT_SKILL_ROLES.has(role) || !EXPERT_SKILLS_DIR) return '';
   return `\n\n## Expert skills (ADVISORY — opt-in, enabled this run)\n` +
-    `Also query ${EXPERT_SKILLS_DIR}/index.yaml for skills whose \`match\` fits this op and whose ` +
+    `Also query ${EXPERT_SKILLS_DIR}/index.yaml for skills whose \`match\` fits this op, whose \`scope\` ` +
+    `is \`kernel\` (\`tuning\` entries belong to the e2e tuning phase and match every operator), and whose ` +
     `validation_status is \`validated\`, and treat each as a HIGH-PRIOR candidate — advisory only, never ` +
     `overriding your isolated A/B vs the oracle, never reducing a result below the measured baseline.`;
 }
@@ -374,6 +375,11 @@ const results = await Promise.all(lanes.map(l => sem.with(1, async ([gpu]) => {
   try {
     const r = await workflow({ scriptPath: WORKER }, {
       kernel_path: oracle.task_dir, workflow_dir: WORKFLOW_DIR,
+      // This lane runs on an oracle_freezer-frozen task dir, so a GEAK_TIMING_RECEIPT is EXPECTED and
+      // its absence is a real fault. The optimize/author path spreads {...A} and never sets this, so a
+      // pass-through lane (and e2e, which calls this worker directly) correctly defaults to false —
+      // there is no Freeze on those routes, so director must not demand a receipt they cannot produce.
+      frozen_oracle: 'true',
       mode: l.mode, target_language: l.lang,
       op_spec: oracle.op_spec || OP_SPEC, workload_spec_path: oracle.workload_path || WORKLOAD_SPEC_PATH || '',
       budget: BUDGET, gpu_ids: gpu, gpu_mode: GPU_MODE, task: TASK, apply_to_original: 'false',

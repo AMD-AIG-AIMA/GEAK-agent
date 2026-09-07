@@ -117,29 +117,18 @@ Steps:
    ```bash
    mkdir -p "$EVAL_DIR/baseline" "$EVAL_DIR/workspace"
    echo "$KERNEL_PATH_ORIG" > "$EVAL_DIR/original_kernel_path.txt"
-   # Copy the kernel into baseline + workspace while EXCLUDING .git and all build artifacts at copy
-   # time (tar-pipe; rsync may be absent). This means we NEVER run a risky `rm -rf .git` (no approval
-   # friction) AND the source .git — which may carry prior/optimized history — can never leak into a
-   # workspace where an engineer could `git show` it. IMPORTANT: also dropping any `.torch_ext` —
-   # torch's build.ninja stores ABSOLUTE source paths, so an inherited cache would rebuild the wrong
-   # location; each workspace must build its own fresh. ALSO exclude reference_io.pt: the golden is BIG
-   # (~1 GB) and IMMUTABLE, so we SHARE the single original via an absolute symlink (below) instead of
-   # copying it into every workspace. Only `workspace/` needs it (CANONICAL = workspace; the unittest
-   # loads it there and baseline/ never reads a golden).
+   # Issue #429: ALWAYS use materialize_workspace.sh for baseline + workspace. Agents that
+   # previously inlined tar sometimes omitted --exclude='*.so' and copied multi-GiB aiter/jit/*.so
+   # into every clone. Script excludes nested *.so/*.o and aiter/jit, never -h/--dereference.
+   # reference_io.pt is excluded from the tar and shared via absolute symlink below.
    for d in baseline workspace; do
-     ( cd "$KERNEL_PATH_ORIG" && tar \
-         --exclude='./.git' --exclude='*/.git' \
-         --exclude='./build' --exclude='*/build' \
-         --exclude='./__pycache__' --exclude='*/__pycache__' \
-         --exclude='./.torch_ext' --exclude='*/.torch_ext' \
-         --exclude='./.rocprofv3' --exclude='*/.rocprofv3' \
-         --exclude='./reference_io.pt' --exclude='*/reference_io.pt' \
-         --exclude='*.so' --exclude='*.o' \
-         -cf - . ) | ( cd "$EVAL_DIR/$d" && tar -xf - )
+     bash "${WORKFLOW_DIR:-$SKILL_DIR}/scripts/materialize_workspace.sh" \
+       --src "$KERNEL_PATH_ORIG" --dst "$EVAL_DIR/$d" \
+       --shared-root "$EVAL_DIR/_shared" --link-aiter
    done
    # Share the immutable golden by absolute symlink (sha check + torch.load are transparent through it;
    # downstream engineer/verify tars carry the symlink verbatim — never add -h/--dereference).
-   [ -e "$KERNEL_PATH_ORIG/reference_io.pt" ] && ln -s "$KERNEL_PATH_ORIG/reference_io.pt" "$EVAL_DIR/workspace/reference_io.pt"
+   [ -e "$KERNEL_PATH_ORIG/reference_io.pt" ] && ln -sfn "$KERNEL_PATH_ORIG/reference_io.pt" "$EVAL_DIR/workspace/reference_io.pt"
    cd "$EVAL_DIR/workspace"
    # Keep build artifacts out of git so patches (git diff) stay clean source-only across all roles.
    printf '%s\n' 'build/' '__pycache__/' '*.so' '.torch_ext/' '.rocprofv3/' '*.o' > .gitignore
@@ -211,28 +200,20 @@ baseline latencies recorded at benchmark setup).
    export GIT_PAGER=cat GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true
    # NO `rm` (it triggers an approval prompt that blocks autonomous runs). Use a UNIQUE validation
    # workspace each time so nothing is ever deleted; move any pre-existing one aside (mv, not rm).
+   # Issue #429: ALWAYS use materialize_workspace.sh (recursive *.so exclude; never -h).
    VWS="$EVAL_DIR/validation_workspace"
    [ -e "$VWS" ] && mv "$VWS" "${VWS}.old_$(date +%s)_$$" 2>/dev/null || true
-   mkdir -p "$VWS"
-   # Copy from the ORIGINAL excluding .git + build artifacts (tar-pipe), so the source history can't
-   # leak into validation and no build cache is inherited. Exclude the big immutable golden too — it is
-   # shared via an absolute symlink below (validation runs correctness, so it must resolve).
-   ( cd "$KERNEL_PATH_ORIG" && tar \
-       --exclude='./.git' --exclude='*/.git' \
-       --exclude='./build' --exclude='*/build' \
-       --exclude='./__pycache__' --exclude='*/__pycache__' \
-       --exclude='./.torch_ext' --exclude='*/.torch_ext' \
-       --exclude='./.rocprofv3' --exclude='*/.rocprofv3' \
-       --exclude='./reference_io.pt' --exclude='*/reference_io.pt' \
-       --exclude='*.so' --exclude='*.o' \
-       -cf - . ) | ( cd "$EVAL_DIR/validation_workspace" && tar -xf - )
-   [ -e "$KERNEL_PATH_ORIG/reference_io.pt" ] && ln -s "$KERNEL_PATH_ORIG/reference_io.pt" "$EVAL_DIR/validation_workspace/reference_io.pt"
-   cd "$EVAL_DIR/validation_workspace"
+   bash "${WORKFLOW_DIR:-$SKILL_DIR}/scripts/materialize_workspace.sh" \
+     --src "$KERNEL_PATH_ORIG" --dst "$VWS" \
+     --shared-root "$EVAL_DIR/_shared" --link-aiter
+   [ -e "$KERNEL_PATH_ORIG/reference_io.pt" ] && ln -sfn "$KERNEL_PATH_ORIG/reference_io.pt" "$VWS/reference_io.pt"
+   cd "$VWS"
    git init -q
    git -c user.email=team@workflow -c user.name=team add -A
    git -c user.email=team@workflow -c user.name=team commit -q -m "validation_baseline"
    git apply "$EVAL_DIR/final_patch.diff"
-   # (No artifact cleanup needed — the tar copy excluded build/__pycache__/*.so; git apply adds only source.)
+   # Soft reclaim of prior validation_workspace.old_* (keeps disk bounded across re-validates).
+   bash "${WORKFLOW_DIR:-$SKILL_DIR}/scripts/reclaim_eval_artifacts.sh" --eval-dir "$EVAL_DIR" --keep-round 0 2>/dev/null || true
    ```
 3. Run CORRECTNESS (from COMMANDMENT, with cwd = validation_workspace). If it fails → status
    `flagged`, record the failure, do NOT report a speedup as accepted.
@@ -265,24 +246,39 @@ baseline latencies recorded at benchmark setup).
    - Within 10%, or Director higher → `accepted`.
    - Director LOWER than claim by >10% → `flagged` (use Director's measured numbers as official).
    - Correctness fail / patch fails to apply → `flagged`.
-   **TIMING RECEIPT GATE — run this BEFORE the comparisons above.** Parse `GEAK_TIMING_RECEIPT` out of the
-   FULL_BENCHMARK output (see `oracle_freezer.md` step 4) and copy it verbatim into
+   **TIMING RECEIPT GATE — run this BEFORE the comparisons above.**
+   **First check `FROZEN_ORACLE`.** The receipt comes from `oracle_freezer`'s generated `unittest.py`, and
+   `oracle_freezer` runs ONLY in the bake-off dispatcher's Freeze phase. A pass-through lane
+   (`mode=optimize`/`author`, or any caller invoking `kernel_lane.js` directly, e.g. e2e) never freezes,
+   so there is no FULL_BENCHMARK output to parse and nothing to demand.
+   - `FROZEN_ORACLE` is NOT `true` → set `timing_basis: "not_applicable"`, emit `timing_receipt: null`,
+     and note in `arbitration_note` that the baseline came from this lane's own `baseline_timing.json`.
+     Do NOT set `status: "flagged"` on this basis — go straight to the comparisons above and let
+     correctness / patch-install / arbitration decide status on their own merits. A missing receipt here
+     is the SHAPE of the route, not a fault in the run.
+
+   `FROZEN_ORACLE=true` → a receipt is expected and its absence IS a fault. Parse `GEAK_TIMING_RECEIPT`
+   out of the FULL_BENCHMARK output (see `oracle_freezer.md` step 4) and copy it verbatim into
    `director_validation.json` as `timing_receipt`. A speedup is a claim about DEVICE time; the receipt is
    the only evidence that it is one. Then:
-   - `all_primed: true` → proceed normally.
+   - `all_primed: true` → set `timing_basis: "clean"` and proceed normally.
    - `all_primed: false` with `timer_unprimed: false` → at least one leg is HOST-BOUND at these dims. The
      ratio is a dispatch-latency ratio, not a kernel speedup. Still report the number, but set
      `timing_basis: "host_bound"` and name the affected cases in `arbitration_note` — a host-bound win does
      NOT survive integration into a server that already replays this op inside its own graph.
-   - `timer_unprimed: true` → the task was frozen against a `harness_lib.py` that predates dispatch priming,
-     so BOTH legs carry a bubble of unknown sign. Set `timing_basis: "unprimed"` and `status: "flagged"`.
-     Do not attempt a correction factor: the bubble is a constant that inflates whichever leg is relatively
-     smaller, so it moves different cases in different directions. Re-freeze against a current
+   - `timer_unprimed: true` → the task was frozen against a `harness_lib.py` that predates the receipt, so
+     BOTH legs carry a dispatch component of unknown sign. Set `timing_basis: "unprimed"` and
+     `status: "flagged"`. Do not attempt a correction factor: it inflates whichever leg is relatively
+     smaller, so it moves different cases in different directions. Re-freezing against a current
      `$HARNESS_LIB` is the only fix.
    - Receipt ABSENT entirely → the unittest is older than this contract. `timing_basis: "unknown"`,
-     `status: "flagged"`. Absence is not evidence of priming.
+     `status: "flagged"`. Absence is not evidence of priming. Reachable ONLY when `FROZEN_ORACLE=true`;
+     collapsing it with the `not_applicable` case above would hide a stale-unittest fault behind the
+     normal shape of the default mode.
    Whatever the outcome, `timing_basis` is REQUIRED in `director_validation.json`, and any campaign summary
    that quotes the speedup must carry it — an unlabelled number is read as a clean device-time win.
+   `not_applicable` is a label, not a pass: the number is this lane's own baseline ratio, not a
+   receipt-backed device-time claim, and a cross-lane comparison must not treat it as one.
 7. If `APPLY_TO_ORIGINAL=true` AND status is `accepted`:
    ```bash
    cd "$KERNEL_PATH_ORIG"
@@ -306,6 +302,8 @@ Return JSON:
   "director_verified_speedup_weighted": 0.0,
   "tech_lead_reported_speedup_geomean": 0.0,
   "validation_status": "accepted|flagged",
+  "timing_basis": "clean|host_bound|unprimed|unknown|not_applicable",
+  "timing_receipt": null,
   "correctness": "pass|fail",
   "per_case": [{"name": "...", "baseline_ms": 0.0, "optimized_ms": 0.0, "speedup": 0.0}],
   "applied_to_original": "true|false",
