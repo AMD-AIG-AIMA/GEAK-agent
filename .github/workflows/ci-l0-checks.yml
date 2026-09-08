@@ -282,6 +282,8 @@ jobs:
       # exercise the JS half, and the clock is pure time arithmetic — no GPU, no model.
       - name: wall-clock budget / final reserve regression
         run: node e2e_workflow/scripts/test_time_budget_reserve.js
+      - name: complete and legacy returned configuration regression
+        run: node e2e_workflow/scripts/test_return_config_mode.js
 
   tuning-skillset-integrity:
     name: Vendored tuning skillset matches its manifest

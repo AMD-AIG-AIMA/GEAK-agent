@@ -34,6 +34,7 @@ Inputs: `LAUNCH_SCRIPT` (path to a bench/launch script; may be empty), `MODEL_PA
 (sglang|vllm; default sglang), `EXP_ROOT`, `EVAL_DIR_OVERRIDE` (may be empty), `MODEL_NAME_HINT`,
 `TASK`, `SKILL_DIR`, `GPU_IDS`, `SERVING_TP`/`SERVING_GPU` (serving config invariant), `WORKLOAD`
 (ISL/OSL/conc), `INIT_FLAGS` (seed `--server` flags from the caller's best config; may be empty),
+`INIT_ARGS_MODE` (optional `replace`: `INIT_FLAGS` is complete, including an empty string),
 `INIT_ENV` (seed `KEY=VAL` env from the caller's best config; may be empty),
 `INIT_BASE_OVERLAY` (the caller's current-best Python overlay/source stack),
 `MEASUREMENT_MODE`, `MEASUREMENT_PURPOSE`, `REPLICAS`, and
@@ -94,6 +95,8 @@ Steps:
    the baseline MUST be measured ON them (pass `EXTRA_SERVER_ARGS`/`EXTRA_ENV`), so GEAK's baseline
    == the caller's best config and later kernel gains compound on top of it. Use the copied bench script
    (substitute the actual SERVING_TP / SERVING_GPU values from your inputs):
+   When `INIT_ARGS_MODE=replace`, pass `INIT_FLAGS` verbatim, including empty flags;
+   do not restore recipe flags or substitute setup defaults for that argument string.
    ```bash
    BACKEND="<backend>" OUT_DIR="$EVAL_DIR/baseline" GPU="<SERVING_GPU>" TP="<SERVING_TP>" MODEL="$MODEL_PATH" \
    ISL=<isl> OSL=<osl> CONC=<conc> PROFILE=0 \

@@ -793,6 +793,32 @@ def test_emit_on_success(monkeypatch, tmp_path):
     assert (eval_dir / "kernel_journey.json").is_file()
 
 
+@pytest.mark.parametrize("config", [
+    {"flags": "--context-length 9728", "args_mode": "replace"},
+    {"flags": "", "args_mode": "replace"},
+    {"flags": "--candidate-only", "args_mode": "append"},
+    {"flags": "--legacy-delta"},
+])
+def test_emitted_result_preserves_explicit_argument_semantics(monkeypatch, tmp_path, config):
+    eval_dir = tmp_path / "e2e_fresh"
+    eval_dir.mkdir()
+    accepted = {**config, "env": "'JSON={\"path\": \"two words\"}' EMPTY="}
+    calls = []
+
+    def invoke(prompt, timeout, ed):
+        calls.append(ed)
+        return {"eval_dir": str(eval_dir), "throughput_speedup": 1.16,
+                "final_throughput_tok_s": 535.352,
+                "baseline_throughput_tok_s": 461.314, "accepted_config": accepted}
+
+    _, result_path = _run_main(monkeypatch, tmp_path, eval_dir, invoke=invoke)
+    assert len(calls) == 1
+    result = json.loads(result_path.read_text())["accepted_config"]
+    assert {key: result[key] for key in accepted} == accepted
+    assert result["env_map"] == {"JSON": '{"path": "two words"}', "EMPTY": ""}
+    assert ("args_mode" in result) == ("args_mode" in config)
+
+
 def test_emit_when_workflow_raises_but_disk_has_intermediate(monkeypatch, tmp_path):
     """The killer case: workflow dies before Validate, but an accepted
     intermediate is on disk -> result.json MUST still be ok (not discarded)."""
@@ -815,6 +841,7 @@ def test_emit_when_workflow_raises_but_disk_has_intermediate(monkeypatch, tmp_pa
     )
     assert rp.is_file(), "result.json MUST exist even when workflow raised"
     out = json.loads(rp.read_text())
+    assert "args_mode" not in out["accepted_config"]
     assert out["status"] == "ok"
     assert out.get("recovered_from_disk") is True
     assert out["final_throughput_tok_s"] == pytest.approx(535.352)

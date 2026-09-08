@@ -260,6 +260,7 @@ class TestMapArgs(_RunE2ECase):
         )
         ps = rx.map_args(h)
         self.assertEqual(ps["initial_extra_server_args"], full_args)
+        self.assertEqual(ps["initial_args_mode"], "replace")
         self.assertEqual(ps["initial_extra_env"], "SGLANG_USE_AITER=1")
         self.assertEqual(ps["launch_script"], str(recipe))
 
@@ -282,6 +283,17 @@ class TestMapArgs(_RunE2ECase):
                 self.assertEqual(
                     ps["initial_extra_server_args"], "--block-size 128 --max-num-seqs 64"
                 )
+                self.assertEqual(ps["initial_args_mode"], "replace")
+
+    def test_legacy_delta_is_not_labelled_a_complete_launch(self):
+        ps = rx.map_args(self._handoff(accepted_flags="--cuda-graph-max-bs 64"))
+        self.assertEqual(ps["initial_extra_server_args"], "--cuda-graph-max-bs 64")
+        self.assertNotIn("initial_args_mode", ps)
+
+    def test_complete_empty_launch_is_explicit(self):
+        ps = rx.map_args(self._handoff(schema_version=2, baseline_env_spec={}))
+        self.assertEqual(ps["initial_extra_server_args"], "")
+        self.assertEqual(ps["initial_args_mode"], "replace")
 
     def test_optional_workflow_knobs_are_forwarded_verbatim(self):
         """launch_recipe / phases / carried state are the resume channel:

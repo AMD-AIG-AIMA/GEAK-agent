@@ -363,6 +363,7 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
     }
     if effective is not None:
         ps_args["effective_config_digest"] = effective.digest
+        ps_args["initial_args_mode"] = "replace"
     # Forward the orchestrator's HARD wall-clock budget (the same timeout_s this
     # runner enforces via anyio.fail_after / subprocess timeout) so the JS
     # workflow can self-pace and FINISH (Finalize/Report/Validate + workflow_return

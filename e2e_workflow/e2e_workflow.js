@@ -568,6 +568,7 @@ const WORKLOAD = { isl: ISL, osl: OSL, conc: CONC };
 // default. Serving TP/GPU are handled by SERVING_TP / SERVING_GPU above.
 const INIT_FLAGS = String(A.initial_extra_server_args || '');
 const INIT_ENV = String(A.initial_extra_env || '');
+const INIT_ARGS_MODE = A.initial_args_mode === 'replace' ? 'replace' : 'append';
 // Schema-v2 handoffs may carry the exact Python overlay/source snapshot stack
 // that produced Hyperloom's current best.  This is part of the baseline
 // configuration, not a GEAK-authored candidate, so it must remain underneath
@@ -2200,12 +2201,14 @@ const kbSeedKernels = [];
 let KB_REF_INPUTS = {};
 
 let EVAL_DIR, MODEL_NAME, BASELINE_TPUT, NOISE_BAND, curFlags, curEnv, curOverlay, profile, strategy, kernelQueue, headQueue;
+let curArgsMode = 'append';
 if (want('setup')) {
   phase('Setup');
   const setup = await safeAgent(
     roleAgent('director', 'setup', 'Build the isolated e2e eval dir and record the baseline throughput.', {
       LAUNCH_SCRIPT, MODEL_PATH, EXP_ROOT, EVAL_DIR_OVERRIDE, MODEL_NAME_HINT, TASK,
       GPU_IDS, WORKLOAD, INIT_FLAGS, INIT_ENV, INIT_BASE_OVERLAY,
+      ...(INIT_ARGS_MODE === 'replace' ? { INIT_ARGS_MODE } : {}),
       MEASUREMENT_PURPOSE: 'parity', REPLICAS: PARITY_REPLICAS,
       SKILL_DIR: WORKFLOW_DIR,
     }),
@@ -2215,9 +2218,10 @@ if (want('setup')) {
   MODEL_NAME = setup.model_name || MODEL_NAME_HINT;
   BASELINE_TPUT = setup.baseline_throughput_tok_s;
   NOISE_BAND = setup.noise_band_pct || NOISE_BAND_DEFAULT;
-  // Seed flags/env win when provided (baseline was measured on them); else fall
-  // back to whatever the director resolved.
-  curFlags = INIT_FLAGS || (setup.server_flags && setup.server_flags.extra) || '';
+  // An explicitly complete seed also represents an empty argument list.
+  curArgsMode = INIT_ARGS_MODE;
+  curFlags = curArgsMode === 'replace' ? INIT_FLAGS
+    : INIT_FLAGS || (setup.server_flags && setup.server_flags.extra) || '';
   curEnv = INIT_ENV || (setup.server_env || '');
   curOverlay = INIT_BASE_OVERLAY;
   log(`Setup done. EVAL_DIR=${EVAL_DIR}, baseline ${BASELINE_TPUT} tok/s (noise band ${NOISE_BAND}%)`);
@@ -3032,6 +3036,7 @@ if (want('setup')) {
   NOISE_BAND = ST.noise_band_pct || NOISE_BAND_DEFAULT;
   curFlags = ST.flags || '';
   curEnv = ST.env || '';
+  curArgsMode = ST.args_mode === 'replace' ? 'replace' : 'append';
   curOverlay = ST.overlay || INIT_BASE_OVERLAY;
   profile = { profile_topN_json: ST.profile_topn_json || '' };
   strategy = { config_directions: ST.config_directions || [] };
@@ -4856,6 +4861,7 @@ const carryState = {
   backend: BACKEND,
   eval_dir: EVAL_DIR, model_name: MODEL_NAME, baseline_throughput_tok_s: BASELINE_TPUT,
   noise_band_pct: NOISE_BAND, flags: curFlags, env: curEnv, overlay: curOverlay, throughput: curTput,
+  ...(curArgsMode === 'replace' ? { args_mode: 'replace' } : {}),
   profile_topn_json: profile ? profile.profile_topN_json : '',
   config_directions: (strategy && strategy.config_directions) || [],
   headQueue, kernelQueue, accepted_heads: acceptedHeads, flagged_heads: flaggedHeads, accepted_kernels: acceptedKernels,
@@ -4960,7 +4966,8 @@ const wfReturn = {
     : (validation ? `${validation.validation_status || 'flagged'}_no_number_used_carried_ab`
        : (want('final') ? 'unknown' : 'phase_partial')),
   output_parity: validation ? validation.output_parity : 'unknown',
-  accepted_config: { flags: curFlags, env: curEnv },
+  accepted_config: { flags: curFlags, env: curEnv,
+    ...(curArgsMode === 'replace' ? { args_mode: 'replace' } : {}) },
   accepted_kernels: acceptedKernels,
   accepted_heads: acceptedHeads,
   // Standalone tuning-skillset phase: its own measured pre/post legs plus the share of the run's TOTAL

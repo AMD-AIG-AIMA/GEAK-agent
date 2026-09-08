@@ -91,6 +91,7 @@ The mapping is owned by `run_e2e.py:map_args`.
 | `workload.{isl,osl,conc}` | `isl`, `osl`, `conc` | profile and bench workload |
 | `accepted_flags` | `initial_extra_server_args` | seeds the baseline from caller best config |
 | `accepted_env` | `initial_extra_env` | seeds baseline env |
+| resolved schema-v2 configuration | `initial_args_mode="replace"` | the resolver supplies the complete argument base, including recipe fallback when the snapshot is unavailable |
 | `launch_recipe` | `launch_script` | optional |
 | `raw_baseline_tput` | result audit metadata | pre-change session baseline; never used as the measurement-alignment signal |
 | `orchestrator_best_tput_same_config` | result alignment metadata | caller throughput on the accepted config GEAK uses for its baseline |
@@ -130,6 +131,15 @@ them: the feature is entirely additive.
 ## `result.json` (workflow → caller)
 
 The workflow writes the following fields to the result file.
+
+`accepted_config.args_mode="replace"` means `flags` is the complete serving
+argument string. A caller must replace inherited recipe/current-stack arguments
+instead of appending it, including when `flags` is empty. The workflow preserves
+this property in phase-to-phase `state.args_mode`. Missing mode means a legacy
+delta: retain the caller's current configuration and apply the returned flags.
+Recovered intermediate results do not acquire completeness from the handoff's
+schema version. Environment omission does not mean deletion; `env_map` remains
+a map of assignments, with deletions represented only by explicit `unset_envs`.
 
 ```jsonc
 {
