@@ -3258,6 +3258,104 @@ if (want('tune') && TUNING_SKILLSET_ENABLED) {
   const tuneOk = tuned && tuning.engagement_verified === true && tuning.ab_complete !== false &&
     tuning.correctness_gate !== 'fail' && tuning.post_tune_throughput_tok_s > 0 &&
     tuning.post_tune_throughput_tok_s > (tuning.pre_tune_throughput_tok_s || 0);
+
+  // Every op the skillset named, regardless of what the phase did with them as a group. Read twice
+  // below: by the accepted-kernel banking, which is gated on `tuneOk`, and by the attestation
+  // immediately under this, which deliberately is not.
+  const tunedOps = (tuning.ops_tuned || []).filter((o) => String(o.op || o.short_name || '').trim());
+
+  // The other half of the recall loop. A RECALLED table that installs but never binds looks exactly
+  // like an empty page to the next run unless this box says so on the record itself; the write below
+  // only ever files wins, so without this the ledger only ever grows in one direction.
+  //
+  // OUTSIDE `tuneOk`, and that placement is the whole point. A verdict on a stored record is a
+  // per-op fact — this table was pulled, installed, and either bound and won or did not — and it is
+  // established the moment the skillset returns. Whether the PHASE clears its aggregate bar is a
+  // different question with different inputs: one recalled op can reproduce perfectly inside a run
+  // whose combined A/B lands at `no_win`, and an accept withheld for absent engagement is the
+  // strongest possible evidence ABOUT the records it recalled. Gating the attest on the aggregate
+  // made both of those emit nothing, so exactly the reads that should demote a record were the ones
+  // that stayed silent, and the ledger could still only grow in one direction.
+  //
+  // Before the write rather than after it: `write-remote` carries the attestation ledger across its
+  // rewrite (see experience_store.py `_carry_remote`), so a win recorded here survives being
+  // re-filed, and on the paths where nothing is written the ordering is moot.
+  //
+  // Searched ops are excluded — they have no prior record to be evidence about. So are recalled ops
+  // that never reached the GPU: `recalls` counts ATTEMPTS ON HARDWARE (kb/attest.py), and a record
+  // listed in an offer nobody benched has learned nothing about itself. An op carries proof of the
+  // attempt in its installed `artifact`, its engagement, or a measurement — absent all three, the
+  // phase died before this op's turn and the silence says nothing about the record.
+  const tuningAttestable = KB_DIMS && KB_DIMS.gfx ? tunedOps.filter((o) =>
+    String(o.session_id || '').trim() &&
+    /recall|kb|knowledge/i.test(String(o.source || o.origin || ''))) : [];
+  const tuningRecalls = tuningAttestable.filter((o) =>
+    o.engaged === true || Number(o.isolated_speedup) > 0 || String(o.artifact || '').trim());
+  const tuningUnattempted = tuningAttestable.length - tuningRecalls.length;
+  if (tuningUnattempted) {
+    log(`[kernel-kb] ${tuningUnattempted} recalled op(s) NOT attested: no artifact, engagement, or ` +
+      `measurement, so they never reached the GPU — an offer nobody benched is not evidence.`);
+  }
+  if (tuningRecalls.length) {
+    const storeScript = KERNEL_WF_DIR + '/scripts/experience_store.py';
+    // A read takes exactly one plane, and so does the verdict on what it served — `both` would count
+    // the same attempt twice on two ledgers that a curation pass then compares. But the plane that
+    // ANSWERED is not the plane that was ASKED FOR: the tuning role is told to retry a remote miss
+    // against the local mirror, so under a requested `both`/`remote` an op may well be holding a
+    // record only the local store has. Attesting that op remotely writes the verdict onto a session
+    // id the local record never sees, and the record that actually mislead this box keeps its rank.
+    // So the op names its own plane, and the requested one is only the fallback for an op that does
+    // not say (`plane` also accepted: the role's instruction is to state which plane answered, and
+    // the two spellings are what the resolve output itself uses).
+    const askedRemote = E2E_KB_PLANE !== 'local';
+    const planeOf = (o) => {
+      const said = String(o.read_plane || o.recall_plane || o.plane || '').trim().toLowerCase();
+      return said === 'local' || said === 'remote' ? said : (askedRemote ? 'remote' : 'local');
+    };
+    const cmds = tuningRecalls.map((o) => {
+      const sp = Number(o.isolated_speedup) || 0;
+      const outcome = o.engaged !== true ? 'not_reproduced' : sp > 1.0 ? 'validated' : 'failed';
+      const plane = planeOf(o);
+      return `python3 ${shq(storeScript)} attest --plane ${plane} ` +
+        (plane === 'local' && E2E_KB_STORE_DIR ? `--store ${shq(E2E_KB_STORE_DIR)} ` : '') +
+        `--session-id ${shq(String(o.session_id).trim())} ` +
+        `--kernel-name ${shq(String(o.op || o.short_name).trim())} ` +
+        `--language ${shq(String(o.backend || 'tuned').trim())} --gfx ${shq(KB_DIMS.gfx)} ` +
+        (KB_DIMS.framework_version ? `--framework-version ${shq(KB_DIMS.framework_version)} ` : '') +
+        `--outcome ${outcome} --measured-speedup ${sp} ` +
+        // `claimed_gate`, not `gate`: the orchestrator's own downgrade of an unproven accept happens
+        // in the branch below this, so what is readable here is the skillset's claim. `banked` is the
+        // orchestrator's verdict on the phase, and it is recorded beside the op's outcome rather than
+        // gating it — a reader auditing a demotion wants to know the recall lost inside a run that
+        // banked nothing, without that being the reason the loss was never written down.
+        `--note ${shq(`e2e tuning recall: engaged=${o.engaged === true}; banked=${!!tuneOk}` +
+          `; claimed_gate=${tuning.gate}` +
+          `${o.note ? '; ' + String(o.note) : ''}`.slice(0, 300))} ` +
+        `--measured-by ${shq('e2e_workflow:tuning:' + BACKEND)} --apply || true`;
+    });
+    // The prelude authenticates the service, so it is needed when ANY op attests remotely — the set
+    // is now mixed by construction.
+    const anyRemote = tuningRecalls.some((o) => planeOf(o) === 'remote');
+    try {
+      await safeAgent(
+        `You are the tuning knowledge-base attestor. Run EXACTLY these commands in order and ` +
+        `return {"ran": <how many you ran>, "note": "<anything that failed>"}. Each records what ` +
+        `this box saw when it installed a RECALLED tuned artifact. Do NOT edit them, do NOT add ` +
+        `or drop any, and do NOT retry a failure — a repeat would double-count the attempt.\n` +
+        '```bash\n' + (anyRemote ? KB_ENV_PRELUDE + '\n' : '') + cmds.join('\n') + '\n```',
+        { phase: 'TuningSkillset', label: 'kernel-kb:attest-tuned',
+          schema: obj({ ran: { type: 'number' }, note: { type: 'string' } }, []) },
+        1);
+      const planes = tuningRecalls.map(planeOf);
+      log(`[kernel-kb] attested ${tuningRecalls.length} recalled tuned op(s) ` +
+        `(${planes.filter((p) => p === 'remote').length} remote, ` +
+        `${planes.filter((p) => p === 'local').length} local; claimed gate=${tuning.gate}` +
+        `${tuneOk ? '' : ', not banked by this phase'}).`);
+    } catch (e) {
+      log(`[kernel-kb] tuned attest failed (NON-FATAL): ${String(e).slice(0, 200)}`);
+    }
+  }
+
   if (tuneOk) {
     const tuningBaselineConfig = { flags: curFlags, env: curEnv };
     if (tuning.apply_env) curEnv = (curEnv ? curEnv + ' ' : '') + tuning.apply_env;
@@ -3294,7 +3392,8 @@ if (want('tune') && TUNING_SKILLSET_ENABLED) {
     // files were [final.patch, launch.sh, report.md] — the lever itself was never recorded, and the
     // next run at that canonical id recalls a configuration it cannot reproduce. Gated on tuneOk, so
     // an unproven tuning claim banks nothing, exactly as it folds nothing into curEnv/curFlags.
-    const tunedOps = (tuning.ops_tuned || []).filter((o) => String(o.op || o.short_name || '').trim());
+    // (`tunedOps` is computed above the branch: the attestation needs it on every path, banking only
+    // on this one.)
     for (const o of tunedOps) {
       bankAccepted(acceptedKernels, {
         short_name: String(o.op || o.short_name).trim(),
@@ -3441,48 +3540,6 @@ if (want('tune') && TUNING_SKILLSET_ENABLED) {
       integrity: { checkpoint_assets: [] },
       tuning_skillset: tuning,
     });
-
-    // The other half of the recall loop. A RECALLED table that installs but never binds looks
-    // exactly like an empty page to the next run unless this box says so on the record itself; the
-    // write above only ever files wins, so without this the ledger only ever grows in one direction.
-    // Searched ops are excluded — they have no prior record to be evidence about.
-    const tuningRecalls = KB_DIMS && KB_DIMS.gfx ? tunedOps.filter((o) =>
-      String(o.session_id || '').trim() &&
-      /recall|kb|knowledge/i.test(String(o.source || o.origin || ''))) : [];
-    if (tuningRecalls.length) {
-      const storeScript = KERNEL_WF_DIR + '/scripts/experience_store.py';
-      // A read takes exactly one plane, and so does the verdict on what it served. `both` would
-      // count the same attempt twice on two ledgers that a curation pass then compares.
-      const remoteOn = E2E_KB_PLANE !== 'local';
-      const cmds = tuningRecalls.map((o) => {
-        const sp = Number(o.isolated_speedup) || 0;
-        const outcome = o.engaged !== true ? 'not_reproduced' : sp > 1.0 ? 'validated' : 'failed';
-        return `python3 ${shq(storeScript)} attest --plane ${remoteOn ? 'remote' : 'local'} ` +
-          (!remoteOn && E2E_KB_STORE_DIR ? `--store ${shq(E2E_KB_STORE_DIR)} ` : '') +
-          `--session-id ${shq(String(o.session_id).trim())} ` +
-          `--kernel-name ${shq(String(o.op || o.short_name).trim())} ` +
-          `--language ${shq(String(o.backend || 'tuned').trim())} --gfx ${shq(KB_DIMS.gfx)} ` +
-          (KB_DIMS.framework_version ? `--framework-version ${shq(KB_DIMS.framework_version)} ` : '') +
-          `--outcome ${outcome} --measured-speedup ${sp} ` +
-          `--note ${shq(`e2e tuning recall: engaged=${o.engaged === true}` +
-            `${o.note ? '; ' + String(o.note) : ''}`.slice(0, 300))} ` +
-          `--measured-by ${shq('e2e_workflow:tuning:' + BACKEND)} --apply || true`;
-      });
-      try {
-        await safeAgent(
-          `You are the tuning knowledge-base attestor. Run EXACTLY these commands in order and ` +
-          `return {"ran": <how many you ran>, "note": "<anything that failed>"}. Each records what ` +
-          `this box saw when it installed a RECALLED tuned artifact. Do NOT edit them, do NOT add ` +
-          `or drop any, and do NOT retry a failure — a repeat would double-count the attempt.\n` +
-          '```bash\n' + (remoteOn ? KB_ENV_PRELUDE + '\n' : '') + cmds.join('\n') + '\n```',
-          { phase: 'TuningSkillset', label: 'kernel-kb:attest-tuned',
-            schema: obj({ ran: { type: 'number' }, note: { type: 'string' } }, []) },
-          1);
-        log(`[kernel-kb] attested ${tuningRecalls.length} recalled tuned op(s).`);
-      } catch (e) {
-        log(`[kernel-kb] tuned attest failed (NON-FATAL): ${String(e).slice(0, 200)}`);
-      }
-    }
 
     // Tuning changed which kernels dominate — re-profile + re-strategize so the head track works the
     // POST-tuning landscape, not the pre-tuning one. Same contract as the post-ConfigSweep re-profile.

@@ -46,15 +46,22 @@ your return which mode you were in).
    no precision are still offered.
    A read takes exactly ONE plane, so `TUNED_KB_PLANE` is never `both`. When it is `remote` and the
    answer comes back with no candidates, retry that op once against the local mirror
-   (`--plane local --store "$TUNED_KB_STORE"`) before concluding the page is empty; say in your
-   return which plane answered.
+   (`--plane local --store "$TUNED_KB_STORE"`) before concluding the page is empty; put the plane
+   that ANSWERED — `"read_plane": "remote|local"` — on that op's `ops_tuned` entry, per op and not
+   once for the phase. The orchestrator writes its verdict back to the plane you name here. Leave it
+   off after a local-mirror fallback and the verdict lands on the remote page, which does not hold
+   the record that misled you; the local one that does keeps its rank on every box after you.
 
    Each candidate hands you `artifact_paths` (copy these), `artifact_names` (**install each under this
    name — the runtime finds it under no other**), `apply_env`, `cache_invalidation`. Your accepted ops
    are written back here by the orchestrator, gated on `isolated_speedup` and `engaged`.
    Carry the candidate's `session_id` into the `ops_tuned` entry you return for that op, and set
    `"source": "recall"`. That is the address the orchestrator attests the outcome back to — without
-   it a recalled table that turns out dead here stays top-ranked for every box after you.
+   it a recalled table that turns out dead here stays top-ranked for every box after you. That
+   attestation does not wait on your `gate`: a recall you installed and measured is reported whether
+   or not the phase as a whole banked a win, so report the op's own `engaged` and `isolated_speedup`
+   honestly even inside a return you are gating `no_win`. Ops you never got onto the GPU are left out
+   of it — an offer nobody benched is not evidence about the record.
 2. **The deployment KB** (`KB_REFERENCE_DIR`): what earlier runs on this whole deployment measured. An
    accepted-kernel entry tagged `from tuning skillset` names its bundle under `KB_CACHE_DIR` and the
    env var binding it.
@@ -185,7 +192,8 @@ soon as the gate is decided, before writing the report — if you can only do on
   "ops_tuned": [
     {"op": "...", "backend": "...", "tuner": "...", "shapes": "...", "isolated_speedup": 1.0,
      "artifact": "<EVAL_DIR>/tuning/...", "engaged": true, "note": "...",
-     "source": "search|recall", "session_id": "<the recalled record's id, when source=recall>"}
+     "source": "search|recall", "session_id": "<the recalled record's id, when source=recall>",
+     "read_plane": "<remote|local — which plane ANSWERED for this op, when source=recall>"}
   ],
   "deploy_bundle": "<EVAL_DIR>/tuning/deploy",
   "deploy_verified": true,
