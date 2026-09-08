@@ -2443,8 +2443,8 @@ def _patch_has_hunks(path: Path) -> bool:
 
 
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-# Shell control characters. A value carrying one of these is not a value: it is
-# a fragment of the launch script that leaked into the assignment string.
+# Unquoted shell control characters identify leaked launch-script fragments.
+# Quoted or escaped occurrences belong to the literal environment value.
 _ENV_VALUE_SHELL_CHARS = ";&|<>()`"
 
 
@@ -2457,9 +2457,9 @@ def _parse_env_assignments(env: str) -> tuple[dict, list]:
     variables — which is exactly how ``EXTRA_ENV=").", RUN_EVAL="true;",
     BACKEND="sglang;"`` reached a downstream rebench.
 
-    So GEAK does the split once and publishes the result: a key must be a real
-    identifier, a value must be free of shell control characters, and a trailing
-    ``;`` (a statement separator the line-joining left behind) is stripped first.
+    GEAK splits once while retaining lexical quoting: a key must be a real
+    identifier, quoted/escaped values stay opaque, and only unquoted ``;``
+    separates assignments. Other unquoted shell control characters are rejected.
     Anything that still fails goes to the reject list rather than being dropped,
     so a consumer can see the string was lossy instead of trusting a map that
     quietly lost a variable.
@@ -2470,29 +2470,68 @@ def _parse_env_assignments(env: str) -> tuple[dict, list]:
     if not text:
         return ok, rejected
     try:
-        tokens = shlex.split(text)
+        lexer = shlex.shlex(text, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = []
+        while True:
+            start = lexer.instream.tell()
+            token = lexer.get_token()
+            if token is None:
+                break
+            tokens.append((token, text[start:lexer.instream.tell()]))
     except ValueError:
-        tokens = text.split()
+        # Retain legacy recovery when the snapshot itself has broken quoting;
+        # no fragment from that fallback receives quoted-literal privileges.
+        tokens = [(token, None) for token in text.split()]
 
-    def _pair(piece: str) -> tuple[str, str] | None:
+    def _pair(piece: str, *, check_shell: bool) -> tuple[str, str] | None:
         key, sep, value = piece.partition("=")
         if (
             sep
-            and _ENV_KEY_RE.match(key)
-            and not any(c in value for c in _ENV_VALUE_SHELL_CHARS)
+            and _ENV_KEY_RE.fullmatch(key)
+            and (not check_shell or not any(c in value for c in _ENV_VALUE_SHELL_CHARS))
         ):
             return key, value
         return None
 
-    for token in tokens:
+    def _quoted_pairs(raw: str) -> list[tuple[str, str] | None]:
+        quote = ""
+        escaped = False
+        start = 0
+        pieces = []
+        for index, char in enumerate(raw):
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote != "'":
+                escaped = True
+            elif quote:
+                if char == quote:
+                    quote = ""
+            elif char in "\"'":
+                quote = char
+            elif char == ";":
+                pieces.append(raw[start:index])
+                start = index + 1
+            elif char in _ENV_VALUE_SHELL_CHARS:
+                return [None]
+        pieces.append(raw[start:])
+        pairs = []
+        for piece in pieces:
+            if piece.strip():
+                words = shlex.split(piece)
+                pairs.append(_pair(words[0], check_shell=False) if len(words) == 1 else None)
+        return pairs
+
+    for token, raw in tokens:
         if not token.strip():
             continue
         # One token can hold several assignments joined by ``;`` — a
         # launch-script line that never got re-split. Take the whole token only
         # if EVERY piece of it is a well-formed assignment, so a half-parsed
         # fragment is quarantined whole instead of contributing half a truth.
-        pieces = [p for p in token.split(";") if p.strip()]
-        pairs = [_pair(p) for p in pieces]
+        pairs = (_quoted_pairs(raw) if raw is not None else
+                 [_pair(piece, check_shell=True) for piece in token.split(";") if piece.strip()])
         if pairs and all(p is not None for p in pairs):
             ok.update(dict(pairs))  # type: ignore[arg-type]
         else:
