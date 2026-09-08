@@ -5,7 +5,7 @@ Why not "copy a subtree + __init__.py onto PYTHONPATH": a regular package (one w
 earlier path entry FULLY shadows the install — Python does not merge regular packages across path
 entries, so every sibling submodule disappears and `import sglang` breaks. The correct, reversible
 mechanism is a `sitecustomize.py` (auto-run by Python at interpreter startup, before anything imports
-the target) that either (a) injects a PATCHED submodule file into sys.modules under its dotted name,
+the target) that either (a) loads a PATCHED submodule file when its dotted name is first imported,
 or (b) imports the real module and REBINDS one attribute (monkeypatch), or (c) installs a capture
 hook. All three are driven by a manifest so multiple overlays COMPOUND (each accepted kernel appends).
 
@@ -39,7 +39,7 @@ Stdlib only.
 import argparse, importlib, json, os, shutil, subprocess, sys
 
 SITECUSTOMIZE = r'''# Auto-generated reversible overlay (e2e_workflow). Drop this dir from PYTHONPATH to revert.
-import json, os, sys, importlib, importlib.util
+import json, os, sys, importlib, importlib.machinery, importlib.util
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MAN = os.path.join(_HERE, "_overlay_manifest.json")
@@ -49,24 +49,47 @@ try:
 except Exception as _e:
     _m = {"modules": [], "rebinds": [], "markers": [], "captures": []}
 
-# (a) inject patched submodules under their dotted names BEFORE anything imports them.
+# (a) register every patched submodule before rebind/capture/marker imports run.
+# Python also starts sitecustomize in multiprocessing helpers and compiler probes.
+# Those processes must not import an inference framework just because an overlay
+# is on PYTHONPATH. Normal import machinery loads the requested replacement,
+# binds its parent attribute, and removes a partial module if execution fails.
+class _OverlayModuleLoader(importlib.machinery.SourceFileLoader):
+    def exec_module(self, module):
+        try:
+            super().exec_module(module)
+        except Exception as error:
+            sys.stderr.write("[overlay] module inject FAILED %s <- %s: %r\n" % (self.name, self.path, error))
+            raise
+        sys.stderr.write("[overlay] injected module %s <- %s\n" % (self.name, self.path))
+
+
+class _OverlayModuleFinder:
+    def __init__(self, files):
+        self.files = files
+        self.overlay_root = _HERE
+
+    def find_spec(self, fullname, path=None, target=None):
+        filename = self.files.get(fullname)
+        if filename is None:
+            return None
+        loader = _OverlayModuleLoader(fullname, filename)
+        return importlib.util.spec_from_file_location(fullname, filename, loader=loader)
+
+
+_module_files = {}
 for _e in _m.get("modules", []):
     try:
-        _dotted, _file = _e["module"], os.path.join(_HERE, _e["file"])
-        _spec = importlib.util.spec_from_file_location(_dotted, _file)
-        _mod = importlib.util.module_from_spec(_spec)
-        sys.modules[_dotted] = _mod
-        _spec.loader.exec_module(_mod)
-        # bind as attribute on the parent so both `from a.b import c` and `import a.b; a.b.c` see the patch.
-        if "." in _dotted:
-            _parent, _child = _dotted.rsplit(".", 1)
-            try:
-                setattr(importlib.import_module(_parent), _child, _mod)
-            except Exception:
-                pass
-        sys.stderr.write("[overlay] injected module %s <- %s\n" % (_dotted, _file))
+        _module_files[_e["module"]] = os.path.join(_HERE, _e["file"])
     except Exception as _ex:
-        sys.stderr.write("[overlay] module inject FAILED %r: %r\n" % (_e, _ex))
+        sys.stderr.write("[overlay] module registration FAILED %r: %r\n" % (_e, _ex))
+if _module_files:
+    for _finder in sys.meta_path:
+        if getattr(_finder, "overlay_root", None) == _HERE:
+            _finder.files.update(_module_files)
+            break
+    else:
+        sys.meta_path.insert(0, _OverlayModuleFinder(_module_files))
 
 # (b) rebind single attributes (monkeypatch).
 for _e in _m.get("rebinds", []):
