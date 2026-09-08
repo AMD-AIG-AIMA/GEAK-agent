@@ -7,7 +7,7 @@ geak_read_extra_env() {
   local _geak_env_file _geak_env_rc
   [ -n "$2" ] || return 0
   _geak_env_file="$(mktemp)" || return 1
-  if python3 "$_GEAK_EXTRA_ENV_PARSER" "$2" > "$_geak_env_file"; then
+  if python3 "$_GEAK_EXTRA_ENV_PARSER" "$2" "${3:-}" > "$_geak_env_file"; then
     mapfile -d '' -t "$1" < "$_geak_env_file"
     _geak_env_rc=$?
   else
@@ -15,4 +15,17 @@ geak_read_extra_env() {
   fi
   rm -f -- "$_geak_env_file"
   return "$_geak_env_rc"
+}
+
+geak_read_unset_env() {
+  geak_read_extra_env "$1" "${2:-}" --unset
+}
+
+geak_env_is_unset() {
+  local _geak_name="$1" _geak_operand
+  shift
+  for _geak_operand in "$@"; do
+    [ "$_geak_operand" != "$_geak_name" ] || return 0
+  done
+  return 1
 }

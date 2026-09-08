@@ -47,9 +47,11 @@ from typing import Any
 
 try:
     # Package import under pytest / module use.
-    from interface.effective_config import resolve_effective_config
+    from interface.effective_config import resolve_effective_config, resolve_unset_envs
 except ModuleNotFoundError:  # Direct: python interface/run_e2e.py ...
-    from effective_config import resolve_effective_config
+    from effective_config import resolve_effective_config, resolve_unset_envs
+
+from e2e_workflow.scripts.adapters.extra_env import parse_unset_envs
 
 SCHEMA_VERSION = 2
 KERNEL_JOURNEY_SCHEMA_VERSION = 1
@@ -364,6 +366,9 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
     if effective is not None:
         ps_args["effective_config_digest"] = effective.digest
         ps_args["initial_args_mode"] = "replace"
+        ps_args["initial_env_complete"] = True
+        if effective.unset_envs:
+            ps_args["initial_unset_envs"] = list(effective.unset_envs)
     # Forward the orchestrator's HARD wall-clock budget (the same timeout_s this
     # runner enforces via anyio.fail_after / subprocess timeout) so the JS
     # workflow can self-pace and FINISH (Finalize/Report/Validate + workflow_return
@@ -1202,6 +1207,7 @@ def apply_bench_launcher(h: dict) -> str:
     else:
         launcher = "native"
     os.environ["BENCH_LAUNCHER"] = launcher
+    effective = None
     if int(h.get("schema_version", 1) or 1) >= 2 and isinstance(
         h.get("baseline_env_spec"), dict
     ):
@@ -1209,8 +1215,15 @@ def apply_bench_launcher(h: dict) -> str:
         # Tell Magpie not to prepend recipe EXTRA_<BACKEND>_ARGS again, which
         # could restore flags intentionally absent from the complete argv.
         os.environ["EFFECTIVE_SERVER_ARGS_COMPLETE"] = "1"
+        effective = resolve_effective_config(h)
     else:
         os.environ.pop("EFFECTIVE_SERVER_ARGS_COMPLETE", None)
+    # Inherited by every benchmark process, including staged native adapters.
+    # Empty controls clear a previous handoff's explicit removals.
+    if effective is not None and effective.unset_envs:
+        os.environ["GEAK_UNSET_ENVS"] = json.dumps(list(effective.unset_envs))
+    else:
+        os.environ.pop("GEAK_UNSET_ENVS", None)
 
     # Magpie's script defaults max-model-len to a value of its own (4096) that
     # has nothing to do with this run, and the orchestrator overrode it via env
@@ -1226,6 +1239,11 @@ def apply_bench_launcher(h: dict) -> str:
     # are trying to match.
     if launcher == "magpie":
         replay, owned = _recipe_launch_env(h)
+        if effective is not None:
+            # The original recipe also has an independent launcher replay path.
+            removed = [key for key in effective.unset_envs if key in replay]
+            replay = {key: value for key, value in replay.items() if key not in removed}
+            owned = sorted(set(owned) | set(removed))
         _export_recipe_env(h, replay, owned, source)
 
         try:
@@ -1249,7 +1267,9 @@ def apply_bench_launcher(h: dict) -> str:
             # Cleared so the launcher's own MAX_MODEL_LEN pass-through cannot
             # land on top of the replayed value.
             os.environ.pop("MAX_MODEL_LEN", None)
-        elif max_model_len > 0:
+        elif max_model_len > 0 and not (
+            effective is not None and "MAX_MODEL_LEN" in effective.unset_envs
+        ):
             os.environ["MAX_MODEL_LEN"] = str(max_model_len)
     return launcher
 
@@ -3123,6 +3143,26 @@ def normalize_result(h: dict, wf: dict) -> dict:
         "recovery": wf.get("recovery_evidence") or None,
     }
 
+    accepted_config = _accepted_config_with_env_map(wf.get("accepted_config") or {})
+    if wf.get("recovered_from_disk"):
+        # Disk evidence can reconstruct assignments without restating the
+        # explicit removals inherited by the run. Preserve that known seed;
+        # do not infer complete argv from a recovered argument string.
+        phases = {part.strip() for part in str(h.get("phases") or "all").split(",")}
+        if phases.intersection({"all", "setup"}):
+            seed = (h.get("baseline_env_spec") or {}).get("config") or {}
+            unsets = set(resolve_unset_envs(
+                seed.get("unset_envs"), seed.get("extra_envs"), h.get("accepted_env"),
+            )) if int(h.get("schema_version", 1) or 1) >= 2 else set()
+        else:
+            seed = h.get("state") or {}
+            unsets = set(resolve_unset_envs(seed.get("unset_envs"), seed.get("env")))
+        unsets.update(parse_unset_envs(accepted_config.get("unset_envs")))
+        unsets.difference_update(accepted_config["env_map"])
+        if unsets:
+            accepted_config["unset_envs"] = sorted(unsets)
+        else:
+            accepted_config.pop("unset_envs", None)
     result = {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -3175,7 +3215,7 @@ def normalize_result(h: dict, wf: dict) -> dict:
         # What the kernel phase actually did (req: report must carry this).
         "accepted_kernels": wf.get("accepted_kernels") or [],
         "accepted_heads": wf.get("accepted_heads") or [],
-        "accepted_config": _accepted_config_with_env_map(wf.get("accepted_config") or {}),
+        "accepted_config": accepted_config,
         # Self-describing baseline measurement-protocol + Hyperloom cross-check (see baseline_basis above).
         "baseline_basis": baseline_basis,
         # Reliability classification is independent of the optimization status.

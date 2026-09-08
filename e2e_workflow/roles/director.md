@@ -18,6 +18,12 @@ The serving stack is **pluggable**: `BACKEND` (sglang|vllm; default sglang) sele
 `scripts/adapters/<backend>.sh`, which `bench_e2e.sh` sources. Everything you launch/bench MUST be
 driven through `bench_e2e.sh` with `BACKEND=<backend>` so the stack stays a swappable detail.
 
+When `INIT_ENV_COMPLETE=true`, use `INIT_ENV` as the resolved assignment string,
+including when it is empty. Do not fill it from the original recipe. Apply
+`INIT_UNSET_ENVS` (setup) or `FINAL_FLAGS.unset_envs` (validation) by exporting their
+JSON array as `GEAK_UNSET_ENVS` for `bench_e2e.sh`. The adapter removes those names
+before current assignments; omitting an assignment alone does not remove it.
+
 ## Isolation contract (non-negotiable)
 - The user's model weights and the installed serving-stack packages (sglang/vllm/aiter/…) are
   **READ-ONLY**. Never edit site-packages. Every change reaches the server through a reversible

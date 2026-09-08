@@ -92,6 +92,10 @@ def _shell_tokens(text: Any, *, canonicalize_json: bool = True) -> list[str]:
 
 
 def main() -> None:
+    if len(sys.argv) > 2 and sys.argv[2] == "--unset":
+        names = parse_unset_envs(json.loads(sys.argv[1]))
+        sys.stdout.buffer.write(b"".join(b"-u\0" + name.encode() + b"\0" for name in names))
+        return
     tokens = _shell_tokens(sys.argv[1], canonicalize_json=False)
     assignments = []
     for token in tokens:
@@ -103,9 +107,23 @@ def main() -> None:
     sys.stdout.buffer.write(b"".join(token.encode() + b"\0" for token in assignments))
 
 
+def parse_unset_envs(value: Any) -> list[str]:
+    """Validate explicit removals; omitted assignments never imply deletion."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("unset_envs must be a name or a list of names")
+    if any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+           for name in value):
+        raise ValueError("unset_envs entries must be environment identifiers")
+    return sorted(set(value))
+
+
 if __name__ == "__main__":
     try:
         main()
-    except ValueError as error:
+    except (TypeError, ValueError) as error:
         print(f"invalid EXTRA_ENV: {error}", file=sys.stderr)
         sys.exit(2)

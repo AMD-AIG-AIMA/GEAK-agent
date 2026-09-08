@@ -42,7 +42,7 @@ def test_decoder_rejects_malformed_quotes_without_partial_output(monkeypatch, ca
     assert capsysbinary.readouterr().out == b""
 
 
-def launch(tmp_path, launcher, raw, expected, *, staged=False):
+def launch(tmp_path, launcher, raw, expected, *, staged=False, overrides=None):
     capture = tmp_path / "child.json"
     child = tmp_path / "child.py"
     child.write_text(
@@ -81,6 +81,7 @@ def launch(tmp_path, launcher, raw, expected, *, staged=False):
                LOG=str(tmp_path / "server.log"), OUT_DIR=str(tmp_path), BACKEND=backend,
                MAGPIE_LAUNCH_SCRIPT=str(magpie), SERVER_LAUNCH_PREFIX="", WATCHDOG_TIMEOUT="",
                SGLANG_SRC_PYTHONPATH="", ENV_CAPTURE=str(capture), ENV_KEYS=json.dumps(list(expected)))
+    env.update(overrides or {})
     # A raw glob must remain literal even when a matching filename exists.
     (tmp_path / "AUDIT_GLOB=expanded").touch()
     driver = 'set -eu -o pipefail\nsource "$1"\nadapter_launch\n'
@@ -136,3 +137,78 @@ def test_invalid_identifiers_never_become_env_options_or_commands(tmp_path, laun
     result, capture = launch(tmp_path, launcher, raw, {"A\n": None, "RUN_EVAL": "true"})
     assert result.returncode == 0, result.stderr + result.stdout
     assert json.loads(capture.read_text())["env"] == {"A\n": None, "RUN_EVAL": "true"}
+
+
+@pytest.mark.parametrize("launcher", LAUNCHERS)
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("readd", [False, True])
+def test_removed_recipe_and_ambient_env_reach_real_child(tmp_path, launcher, staged, readd):
+    replay = tmp_path / "recipe.nul"
+    replay.write_bytes(b"SGLANG_AITER_MLA_PERSIST=recipe\0KEEP_RECIPE=kept\0")
+    expected = {"SGLANG_AITER_MLA_PERSIST": "3" if readd else None,
+                "AMBIENT_ONLY": None, "KEEP_AMBIENT": "kept"}
+    raw = "SGLANG_AITER_MLA_PERSIST=3" if readd else ""
+    result, capture = launch(tmp_path, launcher, raw, expected, staged=staged, overrides={
+        "GEAK_UNSET_ENVS": json.dumps(["SGLANG_AITER_MLA_PERSIST", "AMBIENT_ONLY"]),
+        "SGLANG_AITER_MLA_PERSIST": "ambient", "AMBIENT_ONLY": "ambient",
+        "KEEP_AMBIENT": "kept", "RECIPE_ENV_FILE": str(replay),
+    })
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert json.loads(capture.read_text())["env"] == expected
+
+
+@pytest.mark.parametrize("launcher", LAUNCHERS)
+@pytest.mark.parametrize("invalid", ['["-S"]', '["X=1"]', '[null]', '{"X":1}', 'broken'])
+def test_invalid_unset_transport_stops_before_child(tmp_path, launcher, invalid):
+    result, capture = launch(tmp_path, launcher, "", {"AUDIT": None},
+                             overrides={"GEAK_UNSET_ENVS": invalid})
+    assert result.returncode != 0
+    assert not capture.exists()
+
+
+@pytest.mark.parametrize("launcher", LAUNCHERS)
+def test_actual_handoff_resolver_and_launcher_preserve_env_removal(tmp_path, launcher, monkeypatch):
+    from interface import run_e2e as rx
+
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text("benchmark:\n  envs:\n    SGLANG_AITER_MLA_PERSIST: '1'\n")
+    handoff = {
+        "schema_version": 2, "framework": launcher.removeprefix("magpie_"),
+        "model_path": "/cpu-only/no-model", "exp_root": str(tmp_path / "geak"),
+        "eval_dir": str(tmp_path / "eval"), "launch_recipe": str(recipe),
+        "bench_launcher": "magpie" if launcher.startswith("magpie_") else "native",
+        "baseline_env_spec": {"config": {"args_mode": "replace", "extra_server_args": "",
+            "server_launch_flags": "", "unset_envs": ["SGLANG_AITER_MLA_PERSIST"]}},
+    }
+    mapped = rx.map_args(handoff)
+    assert mapped["initial_extra_server_args"] == ""
+    assert mapped["initial_extra_env"] == ""
+    assert mapped["initial_env_complete"] is True
+    assert mapped["initial_unset_envs"] == ["SGLANG_AITER_MLA_PERSIST"]
+    with monkeypatch.context() as context:
+        context.setattr(os, "environ", dict(os.environ))
+        rx.apply_bench_launcher(handoff)
+        overrides = {key: os.environ[key] for key in
+                     ("GEAK_UNSET_ENVS", "RECIPE_ENV_FILE") if key in os.environ}
+    overrides["SGLANG_AITER_MLA_PERSIST"] = "ambient"
+    result, capture = launch(tmp_path, launcher, mapped["initial_extra_env"],
+                             {"SGLANG_AITER_MLA_PERSIST": None}, overrides=overrides)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert json.loads(capture.read_text())["env"] == {"SGLANG_AITER_MLA_PERSIST": None}
+
+
+@pytest.mark.parametrize("launcher,key", [
+    ("sglang", "GPU_ARCHS"), ("vllm", "GPU_ARCHS"),
+    ("magpie_sglang", "MAX_MODEL_LEN"), ("magpie_vllm", "MAX_MODEL_LEN"),
+])
+@pytest.mark.parametrize("readd", [False, True])
+def test_adapter_defaults_do_not_restore_removed_or_override_readded_env(tmp_path, launcher, key, readd):
+    # A resolved re-add clears the final unset list, yet its explicit assignment
+    # must still outrank the launcher's ambient/default value.
+    raw = f"{key}=explicit" if readd else ""
+    expected = {key: "explicit" if readd else None}
+    result, capture = launch(tmp_path, launcher, raw, expected, overrides={
+        key: "ambient", "GEAK_UNSET_ENVS": json.dumps([] if readd else [key]),
+    })
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert json.loads(capture.read_text())["env"] == expected

@@ -24,7 +24,7 @@ const accepted = between('  accepted_config: { flags: curFlags', '  accepted_ker
 function run(args = {}, carried = null, setupFlags = '--disable-cuda-graph') {
   const context = {
     A: args, ST: carried || {}, setup: { server_flags: { extra: setupFlags }, server_env: 'RECIPE=1' },
-    curArgsMode: 'append', curFlags: '', curEnv: '', curOverlay: '', curTput: 100,
+    curArgsMode: 'append', curFlags: '', curEnv: '', curUnsetEnvs: [], curOverlay: '', curTput: 100,
     BACKEND: 'sglang', EVAL_DIR: '/eval', MODEL_NAME: 'test', BASELINE_TPUT: 100,
     NOISE_BAND: 0.5, profile: {}, strategy: {}, headQueue: [], kernelQueue: [],
     acceptedHeads: [], flaggedHeads: [], acceptedKernels: [], tuning: null,
@@ -73,7 +73,17 @@ function test() {
   const literal = run({ initial_args_mode: 'replace', initial_extra_env: "'JSON={\"x\": \"space value\"}' EMPTY=" });
   assert.equal(literal.accepted_config.env, "'JSON={\"x\": \"space value\"}' EMPTY=",
     'argument completeness does not reinterpret environment assignments');
-  console.log('8 shipped workflow configuration transport cases passed');
+  const unset = run({ initial_extra_env: '', initial_env_complete: true,
+    initial_unset_envs: ['RECIPE'], initial_args_mode: 'replace' });
+  assert.equal(unset.accepted_config.env, '', 'complete empty env cannot restore setup assignments');
+  assert.deepEqual(unset.accepted_config.unset_envs, ['RECIPE']);
+  assert.deepEqual(unset.state.unset_envs, ['RECIPE']);
+  assert.equal(unset.setup_inputs.INIT_ENV_COMPLETE, true);
+  assert.deepEqual(unset.setup_inputs.INIT_UNSET_ENVS, ['RECIPE']);
+  assert.deepEqual(run({}, unset.state).accepted_config, unset.accepted_config);
+  assert(!Object.hasOwn(run({ initial_unset_envs: ['NEW'] }, { flags: '', env: '' }).accepted_config, 'unset_envs'),
+    'older carried state does not acquire a new handoff removal');
+  console.log('11 shipped workflow configuration transport cases passed');
 }
 
 module.exports = { run };

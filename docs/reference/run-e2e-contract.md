@@ -91,7 +91,8 @@ The mapping is owned by `run_e2e.py:map_args`.
 | `workload.{isl,osl,conc}` | `isl`, `osl`, `conc` | profile and bench workload |
 | `accepted_flags` | `initial_extra_server_args` | seeds the baseline from caller best config |
 | `accepted_env` | `initial_extra_env` | seeds baseline env |
-| resolved schema-v2 configuration | `initial_args_mode="replace"` | the resolver supplies the complete argument base, including recipe fallback when the snapshot is unavailable |
+| resolved schema-v2 configuration | `initial_args_mode="replace"`, `initial_env_complete=true` | resolved args and env, including intentional empty strings, seed setup without restoring recipe values |
+| `baseline_env_spec.config.unset_envs` | `initial_unset_envs`, env `GEAK_UNSET_ENVS` | explicit removals from recipe and inherited launcher env; current assignments may re-add a name |
 | `launch_recipe` | `launch_script` | optional |
 | `raw_baseline_tput` | result audit metadata | pre-change session baseline; never used as the measurement-alignment signal |
 | `orchestrator_best_tput_same_config` | result alignment metadata | caller throughput on the accepted config GEAK uses for its baseline |
@@ -101,6 +102,23 @@ The mapping is owned by `run_e2e.py:map_args`.
 | `bench_protocol.*` | env `RANDOM_RANGE_RATIO`, `NUM_PROMPTS`, `NUM_WARMUPS`, `SEED` | `run_e2e.py:apply_bench_protocol` exports only the provided keys; absent keys keep `bench_e2e.sh` defaults |
 | — | `config_tune="false"` | caller already did config search; not repeated |
 | — | `apply_to_original="true"` | `final/final_launch.sh` and overlay are emitted for sweep reuse |
+
+For schema-v2 `baseline_env_spec.config`, nonempty observed `server_launch_flags`
+supplies the base. If that evidence is unavailable, `args_mode="replace"` uses
+the current argument fields, including an empty string; otherwise the original
+recipe supplies the base. `remove_args` removes inherited keys (or matching
+key/value pairs) before reconciled `extra_server_args` and `accepted_flags` are
+applied. `unset_envs` removes named recipe settings before `extra_envs` and
+`accepted_env` are applied. The resolver records remaining explicit environment
+removals in the effective digest. Missing assignments alone never imply deletion.
+
+`GEAK_UNSET_ENVS` is a JSON array of environment names inherited by the benchmark
+adapters. They remove those names from the child environment before applying the
+current `EXTRA_ENV` assignments. Magpie also filters the independent original
+recipe replay. Run-owned coordinates (GPU masks, model, port, profiler path and
+overlay import path) remain under the adapter's control. Setup, carried state and
+returned `accepted_config.unset_envs` preserve the removal controls; a final launch
+bundle must reproduce them.
 
 ### TraceLens prior autodiscovery
 

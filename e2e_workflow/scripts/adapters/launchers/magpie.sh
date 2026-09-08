@@ -70,6 +70,13 @@ adapter_launch() {
   # Per-backend var NAMES (regular rule), passed to the script via env NAME=VALUE.
   local _args_var="EXTRA_${backend_uc}_ARGS"
   local _prof_var="${backend_uc}_TORCH_PROFILER_DIR"
+  local -a _config_env_unset=()
+  local -A _removed_env=()
+  local _name
+  geak_read_unset_env _config_env_unset "${GEAK_UNSET_ENVS:-}" || return $?
+  for _name in "${_config_env_unset[@]}"; do
+    [ "$_name" = "-u" ] || _removed_env["$_name"]=1
+  done
 
   # The orchestrator's RECORDED launch environment, replayed as the BASE layer.
   # Without it the two servers agree only where their ${X:-default} expansions
@@ -107,6 +114,10 @@ adapter_launch() {
   if ((${#_recipe_env[@]})); then
     local -a _kept=(); local _kv
     for _kv in "${_recipe_env[@]}"; do
+      _name="${_kv%%=*}"
+      if [[ "$_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && [ "${_removed_env[$_name]:-0}" = "1" ]; then
+        continue
+      fi
       case "$_kv" in
         "${_args_var}="*) _recipe_extra="${_kv#*=}" ;;
         ROCR_VISIBLE_DEVICES=*|HIP_VISIBLE_DEVICES=*|CUDA_VISIBLE_DEVICES=*)
@@ -172,7 +183,7 @@ adapter_launch() {
   fi
   if [ "${PROFILE:-0}" = "1" ] && [ "$backend_uc" = "VLLM" ]; then
     local _prof_fields
-    _prof_fields="$(env -- \
+    _prof_fields="$(env "${_config_env_unset[@]}" -- \
       ${_recipe_env[@]+"${_recipe_env[@]}"} \
       ${_extra_env[@]+"${_extra_env[@]}"} \
       PYTHONPATH="${OVERLAY_PYTHONPATH:+$OVERLAY_PYTHONPATH:}${PYTHONPATH:-}" \
@@ -256,7 +267,12 @@ PY
   # be an assignment-or-command operand, so no recipe/EXTRA_ENV value beginning
   # with `-` can be reparsed as an env option (belt-and-braces with the
   # allowlists above). `-u` unsets must precede `--`, hence the split.
-  env "${_env_unset[@]}" -- \
+  local -a _max_model_env=()
+  if [ -n "${MAX_MODEL_LEN:-}" ] && ! geak_env_is_unset MAX_MODEL_LEN "${_config_env_unset[@]}"; then
+    _max_model_env=(MAX_MODEL_LEN="$MAX_MODEL_LEN")
+  fi
+  env "${_config_env_unset[@]}" "${_env_unset[@]}" -- \
+    "${_max_model_env[@]}" \
     ${_recipe_env[@]+"${_recipe_env[@]}"} ${_extra_env[@]+"${_extra_env[@]}"} \
     "${_gpu_env[@]}" \
     PYTHONPATH="${OVERLAY_PYTHONPATH:+$OVERLAY_PYTHONPATH:}${PYTHONPATH:-}" \
@@ -268,7 +284,6 @@ PY
     RESULT_DIR="$_out_dir" \
     SERVER_LOG="$LOG" \
     PROFILE="${PROFILE:-0}" \
-    ${MAX_MODEL_LEN:+MAX_MODEL_LEN="$MAX_MODEL_LEN"} \
     ${PROFILE_DIR:+"${_prof_var}=$PROFILE_DIR"} \
     "${_args_var}=${_extra_args}" \
     bash "$script" >> "$_launchlog" 2>&1

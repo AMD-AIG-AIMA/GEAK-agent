@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from e2e_workflow.scripts.adapters.extra_env import (
     _protect_bare_json as _protect_bare_json,
 )
-from e2e_workflow.scripts.adapters.extra_env import _shell_tokens
+from e2e_workflow.scripts.adapters.extra_env import _shell_tokens, parse_unset_envs
 
 _RECIPE_ARG_ENVS = {
     "vllm": "EXTRA_VLLM_ARGS",
@@ -45,6 +45,7 @@ class EffectiveConfig:
     conflicts: list[dict[str, Any]]
     digest: str
     manifest: dict[str, Any]
+    unset_envs: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached JSON-serialisable representation."""
@@ -123,6 +124,22 @@ def _render_flags(flags: Iterable[_Flag]) -> str:
     return shlex.join(tokens)
 
 
+def _remove_flags(flags: MutableMapping[str, _Flag], specs: Any) -> None:
+    """Apply explicit key or key/value removals before current assignments."""
+    if specs is None:
+        return
+    if isinstance(specs, str):
+        specs = [specs]
+    if not isinstance(specs, (list, tuple)):
+        raise TypeError("remove_args must be a string or list of flag specs")
+    for spec in specs:
+        if not isinstance(spec, str):
+            raise TypeError("remove_args entries must be strings")
+        for flag in _parse_flags(spec):
+            if flag.value is None or flags.get(flag.name) == flag:
+                flags.pop(flag.name, None)
+
+
 def _parse_env(value: Any) -> "OrderedDict[str, str]":
     if value is None or value == "":
         return OrderedDict()
@@ -136,6 +153,14 @@ def _parse_env(value: Any) -> "OrderedDict[str, str]":
             raise ValueError(f"environment entry must be KEY=VALUE: {token!r}")
         result[key] = item
     return result
+
+
+def resolve_unset_envs(names: Any, *environments: Any) -> tuple[str, ...]:
+    """Keep explicit removals that current assignments have not re-enabled."""
+    unsets = set(parse_unset_envs(names))
+    for env in environments:
+        unsets.difference_update(_parse_env(env))
+    return tuple(sorted(unsets))
 
 
 def _reconcile(
@@ -231,8 +256,9 @@ def resolve_effective_config(
 
     For schema v2 a nonempty ``server_launch_flags`` is the complete argument
     base; the recipe supplies arguments only when that snapshot is unavailable.
-    The reconciled current-best delta overrides this base. Recipe environment
-    values remain available in either case. Schema v1 is a legacy pass-through.
+    Explicit ``args_mode=replace`` also suppresses recipe fallback when the
+    observed snapshot is unavailable. Removals precede current assignments.
+    Schema v1 is a legacy pass-through.
     """
 
     data = _load_handoff(handoff)
@@ -240,6 +266,7 @@ def resolve_effective_config(
     baseline = data.get("baseline_env_spec") or {}
     baseline_config = baseline.get("config") or {}
     legacy_server_args: Optional[str] = None
+    unset_envs: tuple[str, ...] = ()
 
     if schema_version < 2:
         # Do not canonicalise or merge old handoffs: legacy consumers forwarded
@@ -267,7 +294,12 @@ def resolve_effective_config(
         # A complete argv records removals by absence. Merging recipe-only flags
         # would restore options the caller removed from its best configuration.
         # Empty launch flags mean unavailable evidence in existing handoffs.
-        recipe_flags = _flag_map(recipe_args) if not launch_flags else OrderedDict()
+        mode = str(baseline_config.get("args_mode") or "append").strip().lower()
+        if mode not in ("append", "replace"):
+            raise ValueError(f"unsupported args_mode: {mode!r}")
+        recipe_flags = (
+            _flag_map(recipe_args) if not launch_flags and mode != "replace" else OrderedDict()
+        )
         extra_flags = _flag_map(baseline_config.get("extra_server_args", ""))
         accepted_flags = _flag_map(data.get("accepted_flags", ""))
         delta_flags = _reconcile(
@@ -293,6 +325,7 @@ def resolve_effective_config(
             kind="server_flag",
             conflicts=conflicts,
         )
+        _remove_flags(final_flags, baseline_config.get("remove_args"))
         _merge_layer(
             final_flags,
             delta_flags,
@@ -302,10 +335,11 @@ def resolve_effective_config(
             conflicts=conflicts,
         )
 
+        removed_envs = parse_unset_envs(baseline_config.get("unset_envs"))
         recipe_env = OrderedDict(
             (key, value)
             for key, value in raw_recipe_env.items()
-            if key not in _ALL_RECIPE_ARG_ENVS
+            if key not in _ALL_RECIPE_ARG_ENVS and key not in removed_envs
         )
         extra_env = _parse_env(baseline_config.get("extra_envs", {}))
         accepted_env = _parse_env(data.get("accepted_env", ""))
@@ -328,6 +362,9 @@ def resolve_effective_config(
             kind="environment",
             conflicts=conflicts,
         )
+        # Absence in the map alone cannot clear inherited launcher settings.
+        # Explicit current assignments may re-add a previously removed name.
+        unset_envs = resolve_unset_envs(removed_envs, final_env)
         snapshots = copy.deepcopy(list(baseline.get("source_snapshots") or []))
         overlay = str(baseline.get("overlay_pythonpath") or "")
 
@@ -347,6 +384,8 @@ def resolve_effective_config(
         "source_snapshots": snapshots,
         "conflicts": conflicts,
     }
+    if unset_envs:
+        manifest["unset_envs"] = list(unset_envs)
     digest = hashlib.sha256(
         json.dumps(
             manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -360,6 +399,7 @@ def resolve_effective_config(
         conflicts=conflicts,
         digest=digest,
         manifest=manifest,
+        unset_envs=unset_envs,
     )
 
 
