@@ -47,12 +47,20 @@ l2_bytes: 4194304
 ## gfx1151 — RDNA3.5, Radeon 8060S (Strix Halo APU) class
 ```yaml
 gfx: gfx1151
-cu: 40
+cu: 40                        # REAL CUs (rocminfo "Compute Unit: 40"); torch reports 20 — see below
+wgp: 20                       # RDNA pairs 2 CUs per work-group processor
 hbm_bw_bytes_s: 256.0e9       # LPDDR5X-8000, 256-bit — pin rate, NOT HBM
 l2_bytes: 2097152
 mall_bytes: 33554432
 ```
 
+- **`cu` here means REAL compute units, and torch does not agree.** Measured on this part:
+  `rocminfo` reports `Compute Unit: 40` (`SIMDs per CU: 2`), while
+  `torch.cuda.get_device_properties(0).multi_processor_count` reports **20** — RDNA pairs two CUs
+  into a work-group processor and torch counts WGPs. The rocminfo figure is the one stored.
+  `derive_peaks_from_props()` normalises the torch figure (`cus_per_mp()`, `cu_basis: "wgp_x2"`) so
+  both paths report the same unit; anything else reading `multi_processor_count` directly on RDNA is
+  2× low. The CDNA rows are unaffected — there `multi_processor_count` already counts CUs.
 
 ## Unknown gfx — derived fallback (confidence: low)
 
