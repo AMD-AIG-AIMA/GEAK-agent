@@ -2337,19 +2337,41 @@ def cmd_resolve_remote(a) -> dict:
     # page HOLDS: the service ignores the `limit` argument and pages `--scan` rows (kb/store_remote
     # .py:candidates), so a busy identity can be read through a keyhole with nothing saying so.
     scanned = [0]
+    # A rung that WAS read, and held live rows, but whose rows the carrier/precision filters took
+    # away is NOT a missing page — yet the descent empties it exactly like one, so without this it
+    # ends at `kernel_page_not_found` with an empty `read_plane`, which is what "nobody ever wrote
+    # this identity" looks like. The two are then indistinguishable to the caller, and the cheapest
+    # reading is the wrong one: a tuning lane asking for `--carrier tuned_artifact` gets told the
+    # page does not exist while a page full of installable diffs sits at that very address. The
+    # local `resolve` has always answered `no_such_carrier`/`no_such_precision` here; keep the first
+    # such rung so the remote answer can say the same thing, with the plane it really read.
+    witness = {}
 
-    def live(canonical_id):
+    def live(canonical_id, tier):
         rows = store.candidates(canonical_id, limit=0)
         scanned[0] = len(rows)
         retired_n = sum(1 for c in rows if _is_retired(c.value))
         kept = rows if include_retired else [c for c in rows if not _is_retired(c.value)]
         of_carrier = [c for c in kept if str((c.value or {}).get("carrier") or "patch") == want_carrier]
         other_carrier[0] = len(kept) - len(of_carrier)
+
+        def note(reason, **extra):
+            if kept and not witness:
+                witness.update({"read_reason": reason, "canonical_id": canonical_id,
+                                "match_tier": tier, "read_plane": read_plane,
+                                "carrier": want_carrier}, **extra)
+
         if not want_precision:
+            if not of_carrier:
+                note("no_such_carrier", other_carriers=other_carrier[0])
             return of_carrier, retired_n
         of_precision = [c for c in of_carrier
                         if _precision_matches(want_precision, _precision_of(c.value))]
         other_precision[0] = len(of_carrier) - len(of_precision)
+        if not of_precision:
+            note("no_such_carrier" if not of_carrier else "no_such_precision",
+                 other_carriers=other_carrier[0], precision=want_precision,
+                 other_precisions=other_precision[0])
         return of_precision, retired_n
 
     # The WHOLE descent is redone on the next plane — ladder, then near misses — rather than
@@ -2359,14 +2381,14 @@ def cmd_resolve_remote(a) -> dict:
     found, retired, read_plane = [], 0, ""
     for store, read_plane in planes:
         for cid, match_tier in ladder:
-            found, retired = live(cid)
+            found, retired = live(cid, match_tier)
             if found:
                 break
         if found:
             break
         near = _store_near_misses(store, ladder[0][0])
         for other in near:
-            found, retired = live(other)
+            found, retired = live(other, "other_version")
             if found:
                 cid, match_tier = other, "other_version"
                 break
@@ -2375,7 +2397,10 @@ def cmd_resolve_remote(a) -> dict:
         if found:
             break
     if not found:
-        return dict(base_out, read_reason="kernel_page_not_found")
+        # Only when NO rung anywhere held live rows is this actually a missing page.
+        if witness:
+            return dict(base_out, **witness)
+        return dict(base_out, read_reason="kernel_page_not_found", read_plane=read_plane)
     base_out.update({"canonical_id": cid, "match_tier": match_tier, "read_plane": read_plane})
 
     try:
