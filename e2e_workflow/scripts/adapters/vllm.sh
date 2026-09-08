@@ -13,9 +13,13 @@
 # The Director's preflight step should smoke-test these two commands on the target image and record
 # any needed EXTRA_SERVER_ARGS BEFORE the run relies on them. This adapter targets the current CLI.
 
+source "$(dirname "${BASH_SOURCE[0]}")/extra_env.sh"
+
 adapter_default_port() { echo 8000; }
 
 adapter_launch() {
+  local -a _extra_env=()
+  geak_read_extra_env _extra_env "${EXTRA_ENV:-}" || return $?
   # Pin GPU_ARCHS so aiter's JIT skips rocm_agent_enumerator/_detect_native (see sglang.sh / gpu_lock.sh).
   local _ga="${GPU_ARCHS:-$(rocminfo 2>/dev/null | grep -m1 -oE 'gfx[0-9a-f]+' || true)}"
   # Enable the server-side torch profiler version-portably. No PROFILE_DIR -> off. The ProfilerConfig
@@ -65,7 +69,7 @@ PY
   # Launch through $SERVER_LAUNCH_PREFIX (adapter contract): it puts the server in its
   # own session so teardown can prove the process group is ours. Empty when unset.
   # shellcheck disable=SC2086
-  ${SERVER_LAUNCH_PREFIX:-} env $EXTRA_ENV \
+  ${SERVER_LAUNCH_PREFIX:-} env -- "${_extra_env[@]}" \
     ${_ga:+GPU_ARCHS=$_ga} \
     HIP_VISIBLE_DEVICES=$GPU CUDA_VISIBLE_DEVICES=$GPU \
     "${_prof_env[@]}" \

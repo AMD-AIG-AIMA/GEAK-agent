@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import shlex
+import sys
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -17,6 +18,12 @@ from typing import Any, Iterable, Mapping, MutableMapping, Optional, Union
 
 import yaml
 
+# run_e2e.py also loads this module directly from the interface/ directory.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from e2e_workflow.scripts.adapters.extra_env import (
+    _protect_bare_json as _protect_bare_json,
+)
+from e2e_workflow.scripts.adapters.extra_env import _shell_tokens
 
 _RECIPE_ARG_ENVS = {
     "vllm": "EXTRA_VLLM_ARGS",
@@ -49,86 +56,6 @@ class EffectiveConfig:
 class _Flag:
     name: str
     value: Optional[str]
-
-
-def _protect_bare_json(
-    text: str, *, canonicalize_json: bool = True
-) -> tuple[str, dict[str, str]]:
-    """Replace balanced bare JSON values before POSIX ``shlex`` removes quotes."""
-
-    protected: dict[str, str] = {}
-    out: list[str] = []
-    i = 0
-    while i < len(text):
-        char = text[i]
-        if char not in "[{" or (i and not (text[i - 1].isspace() or text[i - 1] == "=")):
-            out.append(char)
-            i += 1
-            continue
-
-        opening = char
-        closing = "}" if opening == "{" else "]"
-        depth = 0
-        quoted = False
-        escaped = False
-        end = i
-        while end < len(text):
-            current = text[end]
-            if quoted:
-                if escaped:
-                    escaped = False
-                elif current == "\\":
-                    escaped = True
-                elif current == '"':
-                    quoted = False
-            elif current == '"':
-                quoted = True
-            elif current == opening:
-                depth += 1
-            elif current == closing:
-                depth -= 1
-                if depth == 0:
-                    end += 1
-                    break
-            end += 1
-        if depth:
-            out.append(char)
-            i += 1
-            continue
-
-        candidate = text[i:end]
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            out.append(char)
-            i += 1
-            continue
-        token = f"__GEAK_JSON_{len(protected)}__"
-        protected[token] = (
-            json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            if canonicalize_json else candidate
-        )
-        out.append(token)
-        i = end
-    return "".join(out), protected
-
-
-def _shell_tokens(text: Any, *, canonicalize_json: bool = True) -> list[str]:
-    """Split shell text while protecting bare JSON values."""
-
-    rendered = str(text or "").strip()
-    if not rendered:
-        return []
-    protected_text, protected = _protect_bare_json(
-        rendered, canonicalize_json=canonicalize_json
-    )
-    tokens = shlex.split(protected_text, posix=True)
-    for index, token in enumerate(tokens):
-        for marker, value in protected.items():
-            if marker in token:
-                token = token.replace(marker, value)
-        tokens[index] = token
-    return tokens
 
 
 def _looks_like_flag(token: str) -> bool:

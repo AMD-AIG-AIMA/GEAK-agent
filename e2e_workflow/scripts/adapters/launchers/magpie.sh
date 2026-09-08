@@ -37,6 +37,8 @@
 # adapter_health is inherited from the BACKEND adapter (curl $BASE_URL/health),
 # which works regardless of who launched the server, so it is NOT redefined.
 
+source "$(dirname "${BASH_SOURCE[0]}")/../extra_env.sh"
+
 adapter_launch() {
   local backend_uc script var_script
   backend_uc="$(printf '%s' "${BACKEND:-sglang}" | tr '[:lower:]' '[:upper:]')"
@@ -122,21 +124,12 @@ adapter_launch() {
     if ((${#_kept[@]})); then _recipe_env=("${_kept[@]}"); else _recipe_env=(); fi
   fi
 
-  # EXTRA_ENV carries GEAK's accepted env under test. Split every input line with
-  # `read -ra`, which performs shell word splitting but NOT pathname expansion:
-  # an accepted value such as `FOO=*` must reach the child literally even when
-  # matching files exist in the launcher's cwd. Reading line-by-line is required
-  # because a single `read` stops at the first newline. Keep only strict
-  # IDENTIFIER=VALUE assignments; GPU masks are run-scoped and are re-asserted
-  # separately below.
-  local -a _extra_env=() _extra_env_tokens=() _extra_env_line_tokens=()
-  local _tok _extra_env_line
-  if [ -n "${EXTRA_ENV:-}" ]; then
-    while IFS= read -r _extra_env_line; do
-      read -ra _extra_env_line_tokens <<< "$_extra_env_line"
-      _extra_env_tokens+=("${_extra_env_line_tokens[@]}")
-    done <<< "$EXTRA_ENV"
-  fi
+  # Decode quoted values once without shell expansion. NUL framing preserves
+  # spaces and embedded newlines; the shared parser also accepts legacy bare JSON.
+  # GPU masks are run-scoped and are re-asserted separately below.
+  local -a _extra_env=() _extra_env_tokens=()
+  local _tok
+  geak_read_extra_env _extra_env_tokens "${EXTRA_ENV:-}" || return $?
   for _tok in "${_extra_env_tokens[@]}"; do
     case "$_tok" in
       ROCR_VISIBLE_DEVICES=*|HIP_VISIBLE_DEVICES=*|CUDA_VISIBLE_DEVICES=*)
