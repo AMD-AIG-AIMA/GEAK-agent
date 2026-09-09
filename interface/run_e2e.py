@@ -24,8 +24,10 @@ path. See interface/run_e2e.md for the full contract.
 """
 from __future__ import annotations
 
+import ast
 import atexit
 import glob
+import hashlib
 import json
 import math
 import os
@@ -33,6 +35,7 @@ import re
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -50,6 +53,14 @@ except ModuleNotFoundError:  # Direct: python interface/run_e2e.py ...
 
 SCHEMA_VERSION = 2
 KERNEL_JOURNEY_SCHEMA_VERSION = 1
+E2E_CHECKPOINT_SCHEMA_VERSION = 2
+E2E_CHECKPOINT_FILE = "e2e_validation.json"
+E2E_CHECKPOINT_LEVELS = {
+    "integrator",
+    "config_sweep",
+    "tuning_skillset",
+    "final_pair",
+}
 
 # result.json must never state a speedup its own baseline/final pair
 # contradicts. Anything beyond this absolute gap on final/baseline means the
@@ -2076,6 +2087,244 @@ def _build_baseline_alignment(
     }
 
 
+_HANDOFF_IDENTITY_KEYS = (
+    # Newer handoffs can name the upstream observation explicitly. Keep the
+    # historical names too: they are opaque hashes in older handoffs, but can
+    # still be matched if Magpie's launch evidence records the same hash.
+    "same_config_observed_identity",
+    "observed_server_identity",
+    "same_config_reference_observed_identity",
+    "same_config_reference_identity",
+    "same_config_expected_identity",
+)
+_SERVER_ARGS_IDENTITY_KEYS = (
+    "model_path",
+    "tokenizer_path",
+    "served_model_name",
+    "tp_size",
+    "dp_size",
+    "mem_fraction_static",
+    "context_length",
+    "chunked_prefill_size",
+    "quantization",
+    "dtype",
+    "kv_cache_dtype",
+    "attention_backend",
+    "prefill_attention_backend",
+    "decode_attention_backend",
+    "disable_radix_cache",
+    "trust_remote_code",
+)
+
+
+def _balanced_server_args(text: str) -> str:
+    """Return one complete ``ServerArgs(...)`` expression from log text."""
+    start = text.find("ServerArgs(")
+    if start < 0:
+        return ""
+    depth, quote, escaped = 0, "", False
+    for index, char in enumerate(text[start:], start):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return ""
+
+
+def _parse_sglang_server_args(text: str) -> dict[str, Any]:
+    """Extract stable, observable launch fields from SGLang's startup record."""
+    expression = _balanced_server_args(text)
+    if not expression:
+        return {}
+    try:
+        node = ast.parse(expression, mode="eval").body
+    except (SyntaxError, ValueError):
+        return {}
+    if not isinstance(node, ast.Call):
+        return {}
+    observed: dict[str, Any] = {}
+    for keyword in node.keywords:
+        if keyword.arg not in _SERVER_ARGS_IDENTITY_KEYS:
+            continue
+        try:
+            value = ast.literal_eval(keyword.value)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            observed[keyword.arg] = value
+    return observed
+
+
+def _read_server_identity_evidence(log_path: Path) -> tuple[dict[str, Any], str]:
+    """Read direct launch identity evidence without loading an unbounded log."""
+    try:
+        with log_path.open(encoding="utf-8", errors="ignore") as handle:
+            lines = iter(handle)
+            for line in lines:
+                if "ServerArgs(" not in line:
+                    continue
+                # SGLang normally emits one line. Permit a wrapped startup
+                # record too, but cap it so a malformed log cannot grow memory.
+                record = line
+                while not _balanced_server_args(record) and len(record) < 65536:
+                    try:
+                        record += next(lines)
+                    except StopIteration:
+                        break
+                server_args = _parse_sglang_server_args(record)
+                if server_args:
+                    return {"backend": "sglang", "server_args": server_args}, ""
+    except OSError:
+        return {}, ""
+
+    # A Magpie recipe can log its immutable identity directly. This is useful
+    # for backends other than SGLang and for opaque upstream digest identities.
+    try:
+        with log_path.open(encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                match = re.search(
+                    r"\b(?:observed_)?(?:server_|launch_)?identity\s*[:=]\s*"
+                    r"['\"]?([A-Za-z0-9][A-Za-z0-9:._-]*)",
+                    line,
+                )
+                if match:
+                    return {"launch_identity": match.group(1)}, ""
+    except OSError:
+        pass
+    return {}, ""
+
+
+def _handoff_observed_identity(handoff: dict) -> tuple[Any, str]:
+    """Return the upstream identity exactly as supplied, never synthesized."""
+    for key in _HANDOFF_IDENTITY_KEYS:
+        value = handoff.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip(), key
+        if isinstance(value, dict) and value:
+            return value, key
+    baseline_spec = handoff.get("baseline_env_spec")
+    if isinstance(baseline_spec, dict):
+        value = baseline_spec.get("launch_identity")
+        if isinstance(value, str) and value.strip():
+            return value.strip(), "baseline_env_spec.launch_identity"
+    return None, ""
+
+
+def _identity_value_equal(expected: Any, observed: Any) -> bool | None:
+    """Compare an upstream identity to observed launch facts conservatively."""
+    if isinstance(expected, str):
+        if not isinstance(observed, dict) or not observed.get("launch_identity"):
+            return None
+        return expected == observed["launch_identity"]
+    if not isinstance(expected, dict) or not isinstance(observed, dict):
+        return None
+    expected_token = expected.get("launch_identity") or expected.get("identity")
+    if isinstance(expected_token, str):
+        observed_token = observed.get("launch_identity")
+        if not observed_token:
+            return None
+        return expected_token == observed_token
+    expected_args = expected.get("server_args", expected)
+    observed_args = observed.get("server_args", observed)
+    if not isinstance(expected_args, dict) or not isinstance(observed_args, dict):
+        return None
+    # An upstream observation may intentionally include only a subset. Missing
+    # observed fields are a verification failure, never silently ignored.
+    comparable_keys = [
+        key
+        for key in expected_args
+        if key
+        not in {"backend", "launch_identity", "identity", "source", "evidence_paths"}
+    ]
+    if not comparable_keys:
+        return None
+    if any(key not in observed_args for key in comparable_keys):
+        return None
+    for key, expected_value in expected_args.items():
+        if key not in comparable_keys:
+            continue
+        if observed_args[key] != expected_value:
+            return False
+    expected_backend = expected.get("backend")
+    observed_backend = observed.get("backend")
+    return not expected_backend or expected_backend == observed_backend
+
+
+def _server_identity_alignment(handoff: dict, eval_dir: Path) -> dict[str, Any]:
+    """Compare upstream identity with actual Setup-server launch evidence."""
+    expected, expected_source = _handoff_observed_identity(handoff)
+    candidates = [
+        eval_dir / "baseline" / "server.log",
+        eval_dir / "baseline" / "magpie_launch.log",
+    ]
+    evidence_paths = [str(path) for path in candidates if path.is_file()]
+    observed: dict[str, Any] = {}
+    for path in candidates:
+        observed, _ = _read_server_identity_evidence(path)
+        if observed:
+            break
+
+    if expected is None:
+        status = "unavailable"
+    elif not observed:
+        status = "unverified"
+    else:
+        equal = _identity_value_equal(expected, observed)
+        status = "unverified" if equal is None else "matched" if equal else "mismatched"
+    return {
+        "expected": expected,
+        "expected_source": expected_source or None,
+        "observed": observed or None,
+        "status": status,
+        "evidence_paths": evidence_paths,
+    }
+
+
+def _build_handoff_alignment(
+    setup_same_config_divergence_pct: float | None,
+    *,
+    recipe_aligned: bool,
+    server_identity: dict[str, Any],
+    same_config_reference_status: str = "",
+) -> dict[str, Any]:
+    """Classify the Setup-to-upstream comparison independently of Validate."""
+    metric = _build_baseline_alignment(
+        setup_same_config_divergence_pct,
+        recipe_aligned,
+        same_config_reference_status,
+    )
+    identity_status = server_identity.get("status")
+    if metric["status"].startswith("unavailable"):
+        status = metric["status"]
+    elif identity_status == "mismatched":
+        status = "identity_mismatch"
+    elif identity_status != "matched":
+        # Older handoffs lack an upstream observed identity. A close throughput
+        # number alone is not proof that the same server was launched.
+        status = "unverified"
+    else:
+        status = metric["status"]
+    return {
+        **metric,
+        "status": status,
+        "metric_status": metric["status"],
+        "primary_metric": "setup_seed_same_config_divergence_pct",
+        "server_identity": server_identity,
+    }
+
+
 # Kernel-selection lines a serving stack prints at startup. Substring matching
 # is backend-agnostic on purpose: the goal is not to enumerate backends but to
 # record WHICH kernels the engine actually chose, so a launch that silently fell
@@ -2410,7 +2659,15 @@ def normalize_result(h: dict, wf: dict) -> dict:
     #   disk_director_validation — rebuilt from director_e2e_validation.json.
     #   disk_intermediate_win  — best accepted integrate A/B (no final Validate).
     #   disk_no_gain_synthesis — baseline measured, nothing accepted (do-no-harm).
-    if wf.get("recovered_no_gain"):
+    checkpoint_level = str(wf.get("recovered_e2e_checkpoint_level") or "")
+    tuning_recovery_source = str(wf.get("recovered_tuning_source") or "")
+    if checkpoint_level:
+        result_source = f"disk_e2e_checkpoint_{checkpoint_level}"
+    elif tuning_recovery_source:
+        result_source = f"disk_tuning_skillset_{tuning_recovery_source}_provisional"
+    elif wf.get("recovered_tuning_legacy"):
+        result_source = "disk_tuning_skillset_legacy_provisional"
+    elif wf.get("recovered_no_gain"):
         result_source = "disk_no_gain_synthesis"
     elif wf.get("recovered_intermediate"):
         # disk_stack_provisional — salvaged from candidates the integrator gated
@@ -2466,13 +2723,10 @@ def normalize_result(h: dict, wf: dict) -> dict:
                 wf["accepted_heads"] = [_entry]
             wf["attribution_backfilled"] = True
 
-    # Cross-harness measurement-protocol check. GEAK's measured baseline is
-    # seeded with the upstream orchestrator's accepted config, so compare it
-    # separately with the raw session baseline and the same-config current best.
-    # The A/B pair must be measured in the same session (see
-    # _same_session_baseline). A recovered intermediate win already carries its
-    # own paired legs (ref_med/cand_med from one integrate A/B) and a synthesized
-    # no-gain deliberately reports baseline == final, so neither may be re-based.
+    # The validation base/final pair is the optimization denominator. It is
+    # deliberately NOT the cross-handoff denominator: Validate may run long
+    # after Setup and the box's movement between them is measurement drift, not
+    # a difference between Hyperloom and GEAK.
     same_session_base, baseline_basis_source = 0.0, ""
     if not (wf.get("recovered_intermediate") or wf.get("recovered_no_gain")):
         same_session_base, baseline_basis_source = _same_session_baseline(
@@ -2480,6 +2734,11 @@ def normalize_result(h: dict, wf: dict) -> dict:
         )
     setup_baseline = _positive_finite_float(
         baseline_summary.get("throughput_tok_s_median")
+        or baseline_summary.get("output_throughput_tok_s_median")
+        # The canonical workflow return's baseline is the Setup seed. This
+        # fallback keeps disk-recovered/older runs comparable when their Setup
+        # summary was not retained; it never takes a Validate-time value.
+        or wf.get("baseline_throughput_tok_s")
     )
     geak_baseline = _positive_finite_float(
         same_session_base
@@ -2509,10 +2768,8 @@ def normalize_result(h: dict, wf: dict) -> dict:
     orch_baseline = _positive_finite_float(h.get("raw_baseline_tput"))
     # Orchestrator throughput measured on the SAME config GEAK seeds with
     # (the upstream orchestrator's current-best config). When present it isolates
-    # the PURE
-    # cross-harness measurement residue (identical config, both harnesses) from
-    # the explore/framework config gain that is baked into the raw-baseline
-    # comparison. It remains unavailable when absent from older handoffs.
+    # the pure cross-harness measurement residue from the config gain baked into
+    # the raw-baseline comparison. It remains unavailable for older handoffs.
     orch_same_cfg = _positive_finite_float(
         h.get("orchestrator_best_tput_same_config")
     )
@@ -2520,8 +2777,16 @@ def normalize_result(h: dict, wf: dict) -> dict:
     # really re-measured GEAK's seed config; anything else means the 0.0 is an
     # absence, not a measurement.
     orch_same_cfg_status = str(h.get("same_config_reference_status") or "").strip().lower()
-    raw_session_divergence_pct = _divergence_pct(geak_baseline, orch_baseline)
-    same_config_divergence_pct = _divergence_pct(geak_baseline, orch_same_cfg)
+    # Cross-handoff alignment is fixed to the Setup seed measurement. Never
+    # replace it with the late Validate base leg: doing so turns intra-session
+    # drift into a verdict about the handoff.
+    raw_session_divergence_pct = _divergence_pct(setup_baseline, orch_baseline)
+    same_config_divergence_pct = _divergence_pct(setup_baseline, orch_same_cfg)
+    # Only a Validate-time base leg can measure drift. ``geak_baseline`` may
+    # legitimately fall back to Setup (or an intermediate A/B) for the
+    # optimization result, and calling that a drift measurement would invent a
+    # zero-percent observation.
+    validation_base_for_drift = _positive_finite_float(same_session_base)
 
     # ── serving-stack provenance ─────────────────────────────────────────────
     # WHO launched the server, and WHAT kernels it selected. A cross-harness
@@ -2542,9 +2807,39 @@ def normalize_result(h: dict, wf: dict) -> dict:
             eval_dir / "validation" / "base" / "server.log"
         ),
     }
+    server_identity = _server_identity_alignment(h, eval_dir)
+    handoff_alignment = _build_handoff_alignment(
+        same_config_divergence_pct,
+        recipe_aligned=recipe_aligned,
+        server_identity=server_identity,
+        same_config_reference_status=orch_same_cfg_status,
+    )
     baseline_alignment = _build_baseline_alignment(
         same_config_divergence_pct, recipe_aligned, orch_same_cfg_status
     )
+    setup_evidence_path = eval_dir / "baseline" / "bench_summary.json"
+    validation_evidence_path = eval_dir / "validation" / "base" / "bench_summary.json"
+    measurement_drift_pct = _divergence_pct(
+        validation_base_for_drift, setup_baseline
+    )
+    measurement_drift = {
+        "status": (
+            "measured"
+            if (setup_baseline > 0.0 and validation_base_for_drift > 0.0)
+            else "unavailable"
+        ),
+        "setup_baseline_tok_s": setup_baseline or None,
+        "validation_base_tok_s": validation_base_for_drift or None,
+        "validation_base_source": (
+            baseline_basis_source if validation_base_for_drift > 0.0 else None
+        ),
+        "drift_pct": measurement_drift_pct,
+        "evidence_paths": [
+            str(path)
+            for path in (setup_evidence_path, validation_evidence_path)
+            if path.is_file()
+        ],
+    }
     baseline_basis = {
         # GEAK's own measured baseline (Hyperloom-accepted config = fair engagement baseline; gating uses this).
         "geak_measured_baseline_tok_s": geak_baseline or None,
@@ -2555,9 +2850,15 @@ def normalize_result(h: dict, wf: dict) -> dict:
         # denominator, plus how far the box moved between Setup and Validate.
         # A large drift means the Setup number was never a valid denominator.
         "setup_baseline_tok_s": setup_baseline or None,
+        # Legacy field: a Setup-only result historically rendered as 0.0.
+        # New consumers should use measurement_drift, whose unavailable status
+        # distinguishes that absence from an actual zero-drift remeasurement.
         "baseline_drift_pct": (
-            round((geak_baseline - setup_baseline) / setup_baseline * 100.0, 3)
-            if (geak_baseline > 0.0 and setup_baseline > 0.0) else None
+            measurement_drift_pct
+            if measurement_drift_pct is not None
+            else 0.0
+            if (geak_baseline > 0.0 and geak_baseline == setup_baseline)
+            else None
         ),
         # Hyperloom's own measured baseline forwarded in the handoff (the orchestrator reference).
         "orchestrator_baseline_tok_s": orch_baseline or None,
@@ -2842,10 +3143,20 @@ def normalize_result(h: dict, wf: dict) -> dict:
         "baseline_basis": baseline_basis,
         # Reliability classification is independent of the optimization status.
         "baseline_alignment": baseline_alignment,
+        # Cross-handoff Setup-to-upstream comparison. Unlike the compatibility
+        # baseline_alignment alias above, this requires launch evidence to
+        # declare the server identity verified.
+        "handoff_alignment": handoff_alignment,
+        # Intra-session movement between Setup and Validate only. It explains
+        # denominator changes but never changes handoff_alignment's verdict.
+        "measurement_drift": measurement_drift,
         # WHO launched the servers these numbers were measured on, and which
         # kernels those servers selected. This is what tells a reviewer whether
         # baseline_alignment's divergence is a measurement signal at all.
         "serving_stack": serving_stack,
+        # Actual server identity inferred from the Setup launch, compared with
+        # the upstream observation when the handoff carried one.
+        "server_identity": server_identity,
         # Whether the reported delta is distinguishable from measurement noise,
         # and what the arbitration actually concluded (see above). Audit only.
         "validation_evidence": validation_evidence,
@@ -2942,6 +3253,12 @@ def _tuning_skillset_section(wf: dict, eval_dir: Path) -> dict | None:
         "report_path": t.get("report_path") or str(eval_dir / "tuning" / "tuning_report.md"),
     }
 
+    if t.get("recovered"):
+        section["recovery"] = {
+            "source": t.get("recovery_source") or "unknown",
+            "provisional": True,
+        }
+
     if accepted:
         section["artifacts"] = t.get("artifacts") or []
         section["apply_env"] = t.get("apply_env") or ""
@@ -2999,11 +3316,15 @@ def _format_optional_number(
 
 
 def _render_baseline_alignment_section(result: dict[str, Any]) -> str:
-    """Render a deterministic, same-config-first report section."""
+    """Render a deterministic, Setup-seed-first handoff report section."""
     basis = result.get("baseline_basis") or {}
-    alignment = result.get("baseline_alignment") or {}
+    alignment = (
+        result.get("handoff_alignment") or result.get("baseline_alignment") or {}
+    )
     geak_baseline = _format_optional_number(
-        basis.get("geak_measured_baseline_tok_s"), digits=3, suffix=" tok/s"
+        basis.get("setup_baseline_tok_s") or basis.get("geak_measured_baseline_tok_s"),
+        digits=3,
+        suffix=" tok/s",
     )
     same_config_baseline = _format_optional_number(
         basis.get("orchestrator_best_tput_same_config"),
@@ -3027,6 +3348,9 @@ def _render_baseline_alignment_section(result: dict[str, Any]) -> str:
         alignment.get("warning_threshold_pct"), digits=1, suffix="%"
     )
     status = str(alignment.get("status") or "unavailable")
+    identity = alignment.get("server_identity") or result.get("server_identity") or {}
+    identity_status = str(identity.get("status") or "unavailable")
+    identity_paths = identity.get("evidence_paths") or []
     stack = result.get("serving_stack") or {}
     launcher = str(stack.get("launcher") or "unknown")
     recipe_aligned = bool(alignment.get("recipe_aligned_with_orchestrator", True))
@@ -3074,15 +3398,24 @@ def _render_baseline_alignment_section(result: dict[str, Any]) -> str:
             BASELINE_ALIGNMENT_BEGIN,
             "## Baseline alignment",
             "",
-            "Primary same-config comparison:",
+            "Primary same-config comparison (Setup seed):",
             "",
-            f"- GEAK measured baseline: {geak_baseline}",
+            f"- GEAK measured baseline: {geak_baseline} (Setup seed)",
             (
                 "- Upstream current-best baseline on the same config: "
                 f"{same_config_baseline}"
             ),
             f"- Same-config divergence: {same_config_divergence}",
             f"- Alignment status: `{status}` (warning threshold: ±{threshold})",
+            f"- Observed server identity: `{identity_status}`",
+            (
+                "- Server identity evidence: "
+                + (
+                    ", ".join(f"`{path}`" for path in identity_paths)
+                    if identity_paths
+                    else "unavailable"
+                )
+            ),
             f"- Server launch recipe: `{launcher}`",
             *reference_caveat,
             *recipe_caveat,
@@ -3448,8 +3781,15 @@ def _discover_eval_dir(exp_root: Path) -> Path | None:
     targets EXACTLY the dir this run used, never a sibling from another run.
     """
     pinned = os.environ.get("GEAK_EVAL_DIR", "").strip()
-    if pinned and Path(pinned).is_dir():
-        return Path(pinned)
+    if pinned:
+        pinned_path = Path(pinned)
+        try:
+            pinned_path.resolve().relative_to(exp_root.resolve())
+        except (OSError, ValueError):
+            pass
+        else:
+            if pinned_path.is_dir():
+                return pinned_path
     if not exp_root.is_dir():
         return None
     cands = sorted(
@@ -3478,10 +3818,862 @@ def _enumerate_overlay_kernels(eval_dir: Path) -> list[str]:
             continue
         for d in sorted(base.glob("cand_*")):
             if d.is_dir():
-                name = d.name[len("cand_"):]
+                name = d.name[len("cand_") :]
                 if name and name not in names:
                     names.append(name)
     return names
+
+
+def _checkpoint_digest(checkpoint: dict) -> str:
+    """Digest canonical checkpoint JSON, excluding its self-referential digest."""
+    payload = dict(checkpoint)
+    payload.pop("checkpoint_sha256", None)
+    raw = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _checkpoint_asset_path(eval_dir: Path, raw_path: object) -> Path | None:
+    """Resolve an asset path only when it stays inside this eval directory."""
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    try:
+        candidate = (eval_dir / raw_path).resolve()
+        candidate.relative_to(eval_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return candidate
+
+
+def _checkpoint_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _valid_e2e_checkpoint(
+    checkpoint: dict, eval_dir: Path, allowed_levels: set[str]
+) -> tuple[bool, str]:
+    """Validate a recoverable schema-v2 E2E checkpoint without trusting paths.
+
+    This is deliberately stricter than the legacy artifact readers: a checkpoint
+    is the authoritative recovery contract, so a truncated write, a changed replay
+    asset, or an ambiguous selected overlay must make the whole checkpoint ineligible.
+    """
+    if not isinstance(checkpoint, dict):
+        return False, "checkpoint is not an object"
+    if checkpoint.get("schema_version") != E2E_CHECKPOINT_SCHEMA_VERSION:
+        return False, "unsupported schema_version"
+    if checkpoint.get("checkpoint_type") != "e2e_validation":
+        return False, "wrong checkpoint_type"
+    if checkpoint.get("validation_level") not in allowed_levels:
+        return False, "unexpected validation_level"
+    if checkpoint.get("committed") is not True or checkpoint.get("gate") != "accepted":
+        return False, "checkpoint is not a committed accepted result"
+    if checkpoint.get("eval_dir") != str(eval_dir):
+        return False, "eval_dir does not match recovery target"
+    claimed_digest = checkpoint.get("checkpoint_sha256")
+    if not isinstance(claimed_digest, str) or claimed_digest != _checkpoint_digest(
+        checkpoint
+    ):
+        return False, "checkpoint_sha256 mismatch"
+    parent = checkpoint.get("parent_checkpoint")
+    if parent is not None:
+        if not isinstance(parent, dict):
+            return False, "invalid parent_checkpoint"
+        parent_path = _checkpoint_asset_path(eval_dir, parent.get("path"))
+        parent_digest = parent.get("checkpoint_sha256")
+        parent_doc = _read_json(parent_path) if parent_path else {}
+        if (
+            parent_path is None
+            or not isinstance(parent_digest, str)
+            or not parent_doc
+            or parent_doc.get("checkpoint_sha256") != parent_digest
+            or _checkpoint_digest(parent_doc) != parent_digest
+        ):
+            return False, "parent checkpoint digest mismatch"
+
+    baseline = _positive_finite_float(checkpoint.get("baseline_throughput_tok_s"))
+    final = _positive_finite_float(checkpoint.get("final_throughput_tok_s"))
+    speedup = _positive_finite_float(checkpoint.get("throughput_speedup"))
+    if baseline <= 0.0 or final <= 0.0 or speedup <= 0.0:
+        return False, "non-positive throughput fields"
+    if final <= baseline:
+        return False, "accepted checkpoint has no positive gain"
+    if abs((final / baseline) - speedup) > SPEEDUP_SELF_CONSISTENCY_TOL:
+        return False, "throughput_speedup does not match throughput pair"
+
+    for key in (
+        "baseline_config",
+        "accepted_config",
+        "measurement",
+        "stack",
+        "replay",
+        "integrity",
+    ):
+        if not isinstance(checkpoint.get(key), dict):
+            return False, f"missing {key}"
+    for key in ("accepted_kernels", "accepted_heads"):
+        if not isinstance(checkpoint.get(key), list):
+            return False, f"missing {key}"
+    measurement = checkpoint["measurement"]
+    if not isinstance(measurement.get("workload"), dict):
+        return False, "missing measurement.workload"
+    if measurement.get("measurement_mode") not in {
+        "isolated_server",
+        "warm_server",
+    }:
+        return False, "unsupported measurement mode"
+    if not isinstance(measurement.get("legs"), list) or not measurement["legs"]:
+        return False, "missing measurement legs"
+    acceptance = measurement.get("acceptance")
+    if not isinstance(acceptance, dict):
+        return False, "missing measurement.acceptance"
+    if acceptance.get("gain_exceeds_noise") is not True:
+        return False, "checkpoint gain did not exceed noise"
+    if acceptance.get("correctness_passed") is not True:
+        return False, "checkpoint correctness did not pass"
+
+    slots: set[str] = set()
+    for item in checkpoint["stack"].get("kernel_slots") or []:
+        if not isinstance(item, dict) or item.get("selected") is not True:
+            continue
+        slot = item.get("kernel_slot")
+        if not isinstance(slot, str) or not slot:
+            return False, "selected kernel has no kernel_slot"
+        if slot in slots:
+            return False, "multiple selected candidates for one kernel_slot"
+        slots.add(slot)
+
+    assets = checkpoint["integrity"].get("checkpoint_assets")
+    if not isinstance(assets, list):
+        return False, "missing integrity.checkpoint_assets"
+    for asset in assets:
+        if not isinstance(asset, dict):
+            return False, "invalid checkpoint asset"
+        path = _checkpoint_asset_path(
+            eval_dir, asset.get("snapshot") or asset.get("path")
+        )
+        digest = asset.get("sha256")
+        if path is None or not path.is_file() or not isinstance(digest, str):
+            return False, "missing checkpoint asset"
+        if _checkpoint_file_sha256(path) != digest:
+            return False, "checkpoint asset digest mismatch"
+    return True, ""
+
+
+def _checkpoint_path_value(value: object) -> str:
+    """Read an optional path from schema-v2 path metadata."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        path = value.get("path") or value.get("snapshot")
+        return str(path) if path else ""
+    return ""
+
+
+def _recover_e2e_validation_checkpoint(
+    eval_dir: Path,
+) -> dict | None:
+    """Recover the highest-complete non-Director schema-v2 checkpoint."""
+    tiers = (
+        (Path("final") / E2E_CHECKPOINT_FILE, {"final_pair"}),
+        (Path("overlay") / "accepted_stack" / E2E_CHECKPOINT_FILE, {"integrator"}),
+        (Path("tuning") / E2E_CHECKPOINT_FILE, {"tuning_skillset"}),
+        (Path("config") / E2E_CHECKPOINT_FILE, {"config_sweep"}),
+    )
+    for relative_path, levels in tiers:
+        checkpoint_path = eval_dir / relative_path
+        checkpoint = _read_json(checkpoint_path)
+        valid, _reason = _valid_e2e_checkpoint(checkpoint, eval_dir, levels)
+        if not valid:
+            continue
+        level = str(checkpoint["validation_level"])
+        final_overlay = checkpoint.get("final_overlay")
+        if isinstance(final_overlay, dict):
+            final_overlay = _checkpoint_path_value(final_overlay)
+        return {
+            "eval_dir": str(eval_dir),
+            "throughput_speedup": checkpoint["throughput_speedup"],
+            "baseline_throughput_tok_s": checkpoint["baseline_throughput_tok_s"],
+            "final_throughput_tok_s": checkpoint["final_throughput_tok_s"],
+            "output_parity": (checkpoint["measurement"].get("correctness") or {}).get(
+                "gate", "n/a"
+            ),
+            "validation_status": checkpoint.get("validation_status")
+            or f"recovered_{level}",
+            "final_overlay": final_overlay or "",
+            "final_launch_script": _checkpoint_path_value(
+                checkpoint.get("final_launch_script")
+            ),
+            "accepted_config": checkpoint["accepted_config"],
+            "baseline_config": checkpoint["baseline_config"],
+            "accepted_kernels": checkpoint["accepted_kernels"],
+            "accepted_heads": checkpoint["accepted_heads"],
+            "tuning_skillset": checkpoint.get("tuning_skillset"),
+            "recovered_from_disk": True,
+            "recovered_intermediate": level != "final_pair",
+            "recovered_tuning_skillset": level == "tuning_skillset",
+            "recovered_e2e_checkpoint_level": level,
+            "recovery_evidence": {
+                "checkpoint_path": str(relative_path),
+                "checkpoint_sha256": checkpoint["checkpoint_sha256"],
+                "stack_after_digest": checkpoint["stack"].get("stack_after_digest"),
+            },
+        }
+    return None
+
+
+def _legacy_positive_number(doc: dict, *keys: str) -> float:
+    """First positive finite number in a legacy, schema-drifting artifact."""
+    for key in keys:
+        value = _positive_finite_float(doc.get(key))
+        if value > 0.0:
+            return value
+    return 0.0
+
+
+def _legacy_manifest_env(manifest: dict) -> str:
+    """Canonicalize the structured deploy environment for identity comparison."""
+    env = manifest.get("extra_env")
+    if isinstance(env, dict):
+        return json.dumps(env, sort_keys=True, separators=(",", ":"))
+    if isinstance(env, str):
+        return env.strip()
+    return ""
+
+
+def _legacy_tuning_kernels(manifest: dict) -> list[dict]:
+    """Recover tuning identity only from structured manifest fields."""
+    kernels: list[dict] = []
+    ops = manifest.get("ops_tuned") or manifest.get("operations") or []
+    if isinstance(ops, list):
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            kernel_id = str(op.get("kernel_id") or "").strip()
+            kernel_slot = str(op.get("kernel_slot") or "").strip()
+            if kernel_id and kernel_slot:
+                kernels.append(
+                    {
+                        "short_name": kernel_id,
+                        "kernel_id": kernel_id,
+                        "kernel_slot": kernel_slot,
+                        "backend": op.get("backend") or "geak",
+                        "from_tuning_skillset": True,
+                        "recovery_source": "legacy_manifest",
+                        "provisional": True,
+                    }
+                )
+    if kernels:
+        return kernels
+    # Data-table tuning predates ``ops_tuned``. An explicit config environment
+    # key is still a stable machine-readable identity; do not inspect reports or
+    # free-form log lines to manufacture one.
+    env = manifest.get("extra_env")
+    if not isinstance(env, dict):
+        return kernels
+    for key, value in sorted(env.items()):
+        if not (
+            isinstance(key, str)
+            and key.startswith("AITER_CONFIG_")
+            and isinstance(value, str)
+            and value.strip()
+        ):
+            continue
+        kernel_id = key.removeprefix("AITER_CONFIG_").lower()
+        kernels.append(
+            {
+                "short_name": kernel_id,
+                "kernel_id": kernel_id,
+                "kernel_slot": f"aiter_config:{kernel_id}",
+                "backend": "aiter",
+                "from_tuning_skillset": True,
+                "recovery_source": "legacy_manifest",
+                "provisional": True,
+            }
+        )
+    return kernels
+
+
+def _tuning_recovery_overlay(eval_dir: Path, tuning: dict) -> str | None:
+    """Return a live tuning overlay only when it belongs to this evaluation."""
+    raw = str(tuning.get("apply_overlay") or "").strip()
+    if not raw:
+        return ""
+    try:
+        path = Path(raw)
+        candidate = path.resolve() if path.is_absolute() else (eval_dir / path).resolve()
+        candidate.relative_to(eval_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return str(candidate) if candidate.is_dir() else None
+
+
+def _write_tuning_recovery_launcher(eval_dir: Path) -> str:
+    """Write the executable replay bridge for a data-only tuning deployment."""
+    tuning_dir = eval_dir / "tuning"
+    deploy_script = tuning_dir / "deploy" / "deploy.sh"
+    bench_script = eval_dir / "bench_e2e.sh"
+    launcher = tuning_dir / "recovery_launch.sh"
+    if not deploy_script.is_file() or not bench_script.is_file():
+        return ""
+    content = """#!/usr/bin/env bash
+set -euo pipefail
+OUT_DIR="${1:?expected Hyperloom output directory}"
+export OUT_DIR
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+export GEAK_TUNING_ENV_OUT="$HERE/deploy/apply_env.sh"
+bash "$HERE/deploy/deploy.sh"
+if [[ -s "$GEAK_TUNING_ENV_OUT" ]]; then
+  # shellcheck disable=SC1090
+  source "$GEAK_TUNING_ENV_OUT"
+fi
+exec bash "$ROOT/bench_e2e.sh"
+"""
+    try:
+        if not launcher.is_file() or launcher.read_text(encoding="utf-8") != content:
+            launcher.write_text(content, encoding="utf-8")
+            launcher.chmod(0o755)
+        return str(launcher)
+    except OSError:
+        return ""
+
+
+def _recovered_tuning_material(
+    tuning: dict,
+    eval_dir: Path,
+    speedup: float,
+    *,
+    source: str,
+) -> list[dict]:
+    """Describe recovered tuning data as replay material without inventing code."""
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for op in tuning.get("ops_tuned") or []:
+        if not isinstance(op, dict) or op.get("engaged") is not True:
+            continue
+        isolated = _positive_finite_float(op.get("isolated_speedup"))
+        name = str(op.get("op") or "").strip()
+        artifact = str(op.get("artifact") or "").strip()
+        disposition = " ".join(
+            str(op.get(key) or "")
+            for key in ("op", "note", "status", "decision", "gate")
+        )
+        if (
+            isolated <= 1.0
+            or not name
+            or re.search(r"\b(?:rejected|superseded|do not re-apply|do not apply)\b",
+                         disposition, re.IGNORECASE)
+        ):
+            continue
+        identity = artifact or name
+        if identity in seen:
+            continue
+        seen.add(identity)
+        rows.append(
+            {
+                "short_name": name,
+                "op_kind": "tuning_data_deployment",
+                "backend": op.get("backend") or "tuning_skillset",
+                "artifact": artifact,
+                "isolated": isolated,
+                "e2e_delta_pct": round((speedup - 1.0) * 100.0, 4),
+                "from_tuning_skillset": True,
+                "recovery_source": source,
+                "provisional": True,
+            }
+        )
+    if rows:
+        return rows
+    return [
+        {
+            "short_name": "tuning_data_deployment",
+            "op_kind": "tuning_data_deployment",
+            "backend": "tuning_skillset",
+            "artifact": str(eval_dir / "tuning" / "deploy"),
+            "e2e_delta_pct": round((speedup - 1.0) * 100.0, 4),
+            "from_tuning_skillset": True,
+            "recovery_source": source,
+            "provisional": True,
+        }
+    ]
+
+
+def _tuning_recovery_return(
+    eval_dir: Path,
+    tuning: dict,
+    *,
+    pre: float,
+    post: float,
+    source: str,
+    report_path: Path | None = None,
+) -> dict | None:
+    """Build a workflow-return-shaped provisional tuning recovery."""
+    launcher = _write_tuning_recovery_launcher(eval_dir)
+    overlay = _tuning_recovery_overlay(eval_dir, tuning)
+    if not launcher or overlay is None:
+        return None
+    speedup = post / pre
+    recovered_tuning = dict(tuning)
+    recovered_tuning.update(
+        {
+            "enabled": True,
+            "ran": True,
+            "gate": "accepted",
+            "pre_tune_throughput_tok_s": pre,
+            "post_tune_throughput_tok_s": post,
+            "tuning_speedup": speedup,
+            "recovered": True,
+            "recovery_source": source,
+            "deploy_bundle": str(eval_dir / "tuning" / "deploy"),
+        }
+    )
+    if report_path is not None:
+        recovered_tuning["report_path"] = str(report_path)
+    return {
+        "eval_dir": str(eval_dir),
+        "throughput_speedup": speedup,
+        "baseline_throughput_tok_s": pre,
+        "final_throughput_tok_s": post,
+        "output_parity": tuning.get("correctness_gate") or "unknown",
+        "final_overlay": overlay,
+        "final_launch_script": launcher,
+        "accepted_config": {
+            "flags": str(tuning.get("apply_flags") or ""),
+            "env": str(tuning.get("apply_env") or ""),
+        },
+        "accepted_kernels": _recovered_tuning_material(
+            tuning, eval_dir, speedup, source=source
+        ),
+        "accepted_heads": [],
+        "tuning_skillset": recovered_tuning,
+        "validation_status": f"recovered_tuning_skillset_{source}",
+        "recovered_from_disk": True,
+        "recovered_intermediate": True,
+        "recovered_tuning_source": source,
+        "recovery_evidence": {
+            "source": source,
+            "source_path": (
+                "tuning/tuning_result.json"
+                if source == "tuning_result"
+                else "tuning/tuning_report.md"
+            ),
+            "deploy_script": "tuning/deploy/deploy.sh",
+            "pre_tune_throughput_tok_s": pre,
+            "post_tune_throughput_tok_s": post,
+            "tuning_speedup": speedup,
+            "provisional": True,
+        },
+    }
+
+
+def _recover_tuning_result(eval_dir: Path) -> dict | None:
+    """Recover a formally accepted tuning skillset result without re-benchmarking."""
+    source = eval_dir / "tuning" / "tuning_result.json"
+    tuning = _read_json(source)
+    if not tuning:
+        return None
+    pre = _positive_finite_float(tuning.get("pre_tune_throughput_tok_s"))
+    post = _positive_finite_float(tuning.get("post_tune_throughput_tok_s"))
+    claimed_speedup = _positive_finite_float(tuning.get("tuning_speedup"))
+    actual_speedup = post / pre if pre > 0.0 else 0.0
+    if not (
+        tuning.get("ran") is True
+        and str(tuning.get("gate") or "").lower() == "accepted"
+        and tuning.get("engagement_verified") is True
+        and tuning.get("ab_complete") is True
+        and str(tuning.get("correctness_gate") or "").lower() != "fail"
+        and pre > 0.0
+        and post > pre
+        and claimed_speedup > 1.0
+        and math.isclose(
+            claimed_speedup, actual_speedup, rel_tol=SPEEDUP_SELF_CONSISTENCY_TOL
+        )
+    ):
+        return None
+    return _tuning_recovery_return(
+        eval_dir, tuning, pre=pre, post=post, source="tuning_result"
+    )
+
+
+_REPORT_ACCEPTED_GATE_RE = re.compile(
+    r"(?im)^\s*(?:#+\s*(?:\d+\.\s*)?)?(?:\*\*)?\s*"
+    r"(?:outcome|gate)\s*:\s*`?\s*accepted\b"
+)
+_REPORT_OUTCOME_PAIR_RE = re.compile(
+    r"\(\s*([0-9]+(?:\.[0-9]+)?)\s*(?:→|->)\s*"
+    r"([0-9]+(?:\.[0-9]+)?)\s*tok/s\s*\)",
+    re.IGNORECASE,
+)
+_REPORT_LABELED_PAIR_RE = re.compile(
+    r"\bpre\b[^=\n]{0,80}=\s*([0-9]+(?:\.[0-9]+)?)\s*tok/s"
+    r"[\s·,;|]*\bpost\b[^=\n]{0,80}=\s*"
+    r"([0-9]+(?:\.[0-9]+)?)\s*tok/s",
+    re.IGNORECASE,
+)
+_REPORT_SPEEDUP_RE = re.compile(
+    r"\bspeedup\s*(?:=|:)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:x|×)",
+    re.IGNORECASE,
+)
+
+
+def _recover_tuning_report(eval_dir: Path) -> dict | None:
+    """Recover an accepted historical tuning report without scanning A/B legs."""
+    report = eval_dir / "tuning" / "tuning_report.md"
+    if not report.is_file():
+        return None
+    try:
+        text = report.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not _REPORT_ACCEPTED_GATE_RE.search(text):
+        return None
+    pair = _REPORT_OUTCOME_PAIR_RE.search(text) or _REPORT_LABELED_PAIR_RE.search(text)
+    if pair is None:
+        return None
+    pre = _positive_finite_float(pair.group(1))
+    post = _positive_finite_float(pair.group(2))
+    speedup = post / pre if pre > 0.0 else 0.0
+    claimed = _REPORT_SPEEDUP_RE.search(text)
+    if (
+        pre <= 0.0
+        or post <= pre
+        or speedup <= 1.0
+        or (
+            claimed is not None
+            and not math.isclose(
+                _positive_finite_float(claimed.group(1)),
+                speedup,
+                rel_tol=SPEEDUP_SELF_CONSISTENCY_TOL,
+            )
+        )
+    ):
+        return None
+    tuning = {
+        "engagement_verified": True,
+        "ab_complete": True,
+        "correctness_gate": "unknown",
+        "report_path": str(report),
+    }
+    return _tuning_recovery_return(
+        eval_dir,
+        tuning,
+        pre=pre,
+        post=post,
+        source="markdown_report",
+        report_path=report,
+    )
+
+
+def _legacy_tuning_summary_is_accepted(summary: dict) -> bool:
+    """Validate the archived tuning A/B acceptance evidence conservatively."""
+    if (
+        str(
+            summary.get("output_parity") or summary.get("correctness_gate") or ""
+        ).lower()
+        == "fail"
+    ):
+        return False
+    legs = summary.get("legs")
+    if not isinstance(legs, list) or not legs:
+        return False
+    arms: dict[str, list[dict]] = {"A": [], "B": []}
+    for leg in legs:
+        if not isinstance(leg, dict):
+            return False
+        arm = str(leg.get("arm") or "").upper()
+        if arm not in arms or leg.get("usable") is not True:
+            return False
+        if str(leg.get("mode") or "") != "isolated_server":
+            return False
+        if _positive_finite_float(leg.get("tput")) <= 0.0:
+            return False
+        arms[arm].append(leg)
+    if not arms["A"] or not arms["B"] or int(summary.get("n_pairs") or 0) < 1:
+        return False
+    if any(int(leg.get("hits") or 0) != 0 for leg in arms["A"]):
+        return False
+    if any(int(leg.get("hits") or 0) <= 0 for leg in arms["B"]):
+        return False
+    return (
+        _legacy_positive_number(
+            summary, "paired_mean_delta_pct", "median_pair_delta_pct", "delta_pct"
+        )
+        > 0.0
+    )
+
+
+def _legacy_bench_pair_value(path: Path) -> tuple[float, dict] | None:
+    """Return a usable isolated-server benchmark's throughput and document."""
+    doc = _read_json(path)
+    if (
+        doc.get("status") != "complete"
+        or doc.get("usable_for_acceptance") is not True
+        or doc.get("measurement_mode") != "isolated_server"
+    ):
+        return None
+    throughput = _legacy_positive_number(
+        doc,
+        "throughput_tok_s_median",
+        "output_throughput_tok_s_median",
+        "observed_median",
+    )
+    return (throughput, doc) if throughput > 0.0 else None
+
+
+def _legacy_log_marker_count(path: Path, marker: str) -> int:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").count(marker)
+    except OSError:
+        return -1
+
+
+def _recover_verified_legacy_final_pair(eval_dir: Path, manifest: dict) -> dict | None:
+    """Recover a corroborated historical final tuning pair, never a validated win."""
+    summary = _read_json(eval_dir / "final" / "FINAL_SUMMARY.json")
+    final_manifest = _read_json(eval_dir / "final" / "tuning" / "MANIFEST.json")
+    tuned = _legacy_bench_pair_value(
+        eval_dir / "final" / "bench" / "bench_summary.json"
+    )
+    control = _legacy_bench_pair_value(
+        eval_dir / "final" / "bench_control" / "bench_summary.json"
+    )
+    if not summary or tuned is None or control is None:
+        return None
+    if (
+        str(
+            summary.get("output_parity") or summary.get("correctness_gate") or ""
+        ).lower()
+        == "fail"
+    ):
+        return None
+    if final_manifest and _legacy_manifest_env(final_manifest) != _legacy_manifest_env(
+        manifest
+    ):
+        return None
+    final_tput, final_doc = tuned
+    baseline, baseline_doc = control
+    summary_final = _legacy_positive_number(summary, "final_bundle_tok_s")
+    summary_baseline = _legacy_positive_number(
+        summary, "drift_control_same_session_tok_s"
+    )
+    if (
+        not math.isclose(final_tput, summary_final, rel_tol=0.005)
+        or not math.isclose(baseline, summary_baseline, rel_tol=0.005)
+        or final_tput <= baseline
+    ):
+        return None
+    speedup = final_tput / baseline
+    reported_speedup = _legacy_positive_number(summary, "paired_in_session_speedup")
+    if (
+        reported_speedup
+        and abs(speedup - reported_speedup) > SPEEDUP_SELF_CONSISTENCY_TOL
+    ):
+        return None
+    engagement = summary.get("tuning_engagement") or {}
+    summary_tuned = int(((engagement.get("final_bundle") or {}).get("tuned_hits") or 0))
+    summary_control = int(
+        ((engagement.get("drift_control") or {}).get("tuned_hits") or 0)
+    )
+    tuned_hits = _legacy_log_marker_count(
+        eval_dir / "final" / "bench" / "replica_001" / "attempt_1" / "server.log",
+        "is tuned on cu_num",
+    )
+    control_hits = _legacy_log_marker_count(
+        eval_dir
+        / "final"
+        / "bench_control"
+        / "replica_001"
+        / "attempt_1"
+        / "server.log",
+        "is tuned on cu_num",
+    )
+    if (
+        tuned_hits <= 0
+        or control_hits != 0
+        or (tuned_hits, control_hits) != (summary_tuned, summary_control)
+    ):
+        return None
+    if final_doc.get("effective_config_digest") != baseline_doc.get(
+        "effective_config_digest"
+    ):
+        return None
+    config = _read_json(eval_dir / "final" / "accepted_config.json")
+    return {
+        "baseline": baseline,
+        "final": final_tput,
+        "speedup": speedup,
+        "ttft_ms": _legacy_positive_number(final_doc, "ttft_ms_median"),
+        "tpot_ms": _legacy_positive_number(final_doc, "tpot_ms_median"),
+        "accepted_config": {
+            "flags": str(config.get("extra_server_args") or ""),
+            "env": str(config.get("extra_env") or _legacy_manifest_env(manifest)),
+        },
+        "final_launch_script": str(eval_dir / "final" / "final_launch.sh"),
+        "evidence": {
+            "measurement": "verified_final_tuning_pair",
+            "summary_path": "final/FINAL_SUMMARY.json",
+            "tuned_bench_path": "final/bench/bench_summary.json",
+            "control_bench_path": "final/bench_control/bench_summary.json",
+            "tuned_hits": tuned_hits,
+            "control_hits": control_hits,
+            "pair_order": "tuned_then_control",
+            "provisional_reason": "single replica and non-counterbalanced final pair",
+        },
+    }
+
+
+def _legacy_tuning_raw_pair(eval_dir: Path) -> tuple[float, float] | None:
+    """Rebuild a conservative tuning A/B from legacy per-leg summaries.
+
+    Some historical tuning roles wrote ``pre[_N]/bench_summary.json`` and
+    ``post[_N]/bench_summary.json`` but never emitted ``ab_summary.json``. A
+    single pre/post comparison is restart noise, not recoverable acceptance
+    evidence; require three matching isolated-server pairs with one effective
+    config digest before considering this legacy format.
+    """
+    ab_dir = eval_dir / "tuning" / "ab"
+    pairs: dict[str, dict[str, tuple[float, str]]] = {}
+    for child in ab_dir.iterdir() if ab_dir.is_dir() else []:
+        if not child.is_dir():
+            continue
+        match = re.fullmatch(r"(pre|post)_?(\d*)", child.name)
+        if not match:
+            continue
+        summary = _read_json(child / "bench_summary.json")
+        if (
+            summary.get("usable_for_acceptance") is not True
+            or summary.get("measurement_mode") != "isolated_server"
+        ):
+            continue
+        throughput = _legacy_positive_number(
+            summary, "throughput_tok_s_median", "output_throughput_tok_s_median"
+        )
+        digest = str(summary.get("effective_config_digest") or "")
+        if throughput <= 0.0 or not digest:
+            continue
+        arm, index = match.groups()
+        hits = _legacy_log_marker_count(
+            child / "replica_001" / "attempt_1" / "server.log", "is tuned on cu_num"
+        )
+        if (arm == "pre" and hits != 0) or (arm == "post" and hits <= 0):
+            continue
+        pairs.setdefault(index or "1", {})[arm] = (throughput, digest)
+    complete = [pair for pair in pairs.values() if {"pre", "post"} <= pair.keys()]
+    if len(complete) < 3:
+        return None
+    digests = {value[1] for pair in complete for value in pair.values()}
+    if len(digests) != 1:
+        return None
+    baseline = statistics.median(pair["pre"][0] for pair in complete)
+    final = statistics.median(pair["post"][0] for pair in complete)
+    return (baseline, final) if final > baseline * 1.01 else None
+
+
+def _recover_tuning_legacy_composite(eval_dir: Path) -> dict | None:
+    """Recover a pre-checkpoint tuning win as explicitly provisional evidence.
+
+    Historical tuning runs wrote a complete interleaved A/B summary and a deploy
+    manifest, but did not serialize the in-memory acceptance gate. Those artifacts
+    are stronger than a no-gain synthesis, yet lack enough information to claim a
+    Director-validated win. Keep the measured pair and deploy replay handle while
+    refusing to fabricate kernel identity when the manifest does not provide it.
+    """
+    summary = _read_json(eval_dir / "tuning" / "ab" / "ab_summary.json")
+    manifest = _read_json(eval_dir / "tuning" / "deploy" / "MANIFEST.json")
+    deploy_script = eval_dir / "tuning" / "deploy" / "deploy.sh"
+    if not manifest or not deploy_script.is_file():
+        return None
+    recovery_launcher = _write_tuning_recovery_launcher(eval_dir)
+    if not recovery_launcher:
+        return None
+    baseline = final = 0.0
+    evidence_source = "tuning/ab/ab_summary.json"
+    if summary:
+        if not _legacy_tuning_summary_is_accepted(summary):
+            return None
+        baseline = _legacy_positive_number(
+            summary,
+            "pre",
+            "pre_median",
+            "pre_median_tok_s",
+            "baseline_throughput_tok_s",
+        )
+        final = _legacy_positive_number(
+            summary,
+            "post",
+            "post_median",
+            "post_median_tok_s",
+            "final_throughput_tok_s",
+        )
+    else:
+        raw_pair = _legacy_tuning_raw_pair(eval_dir)
+        if raw_pair is not None:
+            baseline, final = raw_pair
+            evidence_source = "tuning/ab/{pre,post}*/bench_summary.json"
+    if baseline <= 0.0 or final <= baseline:
+        return None
+    reported_delta = _legacy_positive_number(
+        summary, "median_pair_delta_pct", "paired_mean_delta_pct", "delta_pct"
+    )
+    speedup = final / baseline
+    if reported_delta and abs((speedup - 1.0) * 100.0 - reported_delta) > 5.0:
+        return None
+
+    accepted_kernels = _legacy_tuning_kernels(manifest)
+    final_pair = _recover_verified_legacy_final_pair(eval_dir, manifest)
+    accepted_config = {
+        "flags": str(manifest.get("apply_flags") or ""),
+        "env": str(manifest.get("apply_env") or _legacy_manifest_env(manifest)),
+    }
+    final_launch_script = recovery_launcher
+    evidence = {
+        "summary_path": evidence_source,
+        "deploy_manifest_path": "tuning/deploy/MANIFEST.json",
+        "original_gate": "not_persisted",
+    }
+    if final_pair is not None:
+        baseline = final_pair["baseline"]
+        final = final_pair["final"]
+        speedup = final_pair["speedup"]
+        accepted_config = final_pair["accepted_config"]
+        final_launch_script = final_pair["final_launch_script"]
+        evidence.update(final_pair["evidence"])
+    if len(accepted_kernels) == 1:
+        accepted_kernels[0]["e2e_delta_pct"] = (speedup - 1.0) * 100.0
+    return {
+        "eval_dir": str(eval_dir),
+        "throughput_speedup": speedup,
+        "baseline_throughput_tok_s": baseline,
+        "final_throughput_tok_s": final,
+        "output_parity": "unknown",
+        "validation_status": "recovered_tuning_skillset_legacy_provisional",
+        "final_overlay": "",
+        "final_launch_script": final_launch_script,
+        "accepted_config": accepted_config,
+        "accepted_kernels": accepted_kernels,
+        "accepted_heads": [],
+        "tuning_skillset": {
+            "enabled": True,
+            "ran": True,
+            "gate": "accepted_provisional",
+            "pre_tune_throughput_tok_s": baseline,
+            "post_tune_throughput_tok_s": final,
+            "tuning_speedup": speedup,
+            "deploy_bundle": str(deploy_script.parent),
+            "deploy_verified": False,
+            "original_gate": "not_persisted",
+        },
+        "recovered_from_disk": True,
+        "recovered_intermediate": True,
+        "recovered_tuning_legacy": True,
+        "recovery_evidence": evidence,
+    }
 
 
 def _recover_workflow_return(exp_root: Path) -> dict | None:
@@ -3513,9 +4705,25 @@ def _recover_workflow_return(exp_root: Path) -> dict | None:
         # No final Validate marker => the director never synthesized its json
         # (run killed mid-Validate, or torn down before it wrote). Recover in
         # priority order so a COMPLETED run is NEVER discarded as a parse error:
-        #   1. the best gate==accepted intermediate win (a real measured gain),
-        #   2. else, if a baseline was measured but nothing was accepted, a
+        #   1. a schema-v2 committed checkpoint,
+        #   2. a formally accepted tuning_result.json,
+        #   3. an accepted historical tuning report,
+        #   4. legacy structured tuning evidence,
+        #   5. the best gate==accepted intermediate win (a real measured gain),
+        #   6. else, if a baseline was measured but nothing was accepted, a
         #      legitimate NO_GAIN run (the optimizer correctly did no harm).
+        checkpoint_win = _recover_e2e_validation_checkpoint(eval_dir)
+        if checkpoint_win is not None:
+            return checkpoint_win
+        tuning_result_win = _recover_tuning_result(eval_dir)
+        if tuning_result_win is not None:
+            return tuning_result_win
+        tuning_report_win = _recover_tuning_report(eval_dir)
+        if tuning_report_win is not None:
+            return tuning_report_win
+        tuning_win = _recover_tuning_legacy_composite(eval_dir)
+        if tuning_win is not None:
+            return tuning_win
         win = _recover_best_intermediate_win(eval_dir)
         if win is not None:
             return win
@@ -4391,7 +5599,7 @@ def _journey_return_entry(eval_dir: str, k: dict, idx: int, wf: dict,
     isolated = k.get("isolated") or k.get("micro_speedup") or k.get("verified_isolated_speedup")
     patch = k.get("final_patch") or None
     attempt_id = f"{kid}-{backend}-{idx}"
-    return {
+    entry = {
         "kernel_id": kid, "name": name, "gpu_pct": k.get("pct_gpu_time"),
         "micro_speedup": isolated,
         "dispatch": {"dispatched": True, "backends": [backend], "skip_reason": "",
@@ -4418,6 +5626,21 @@ def _journey_return_entry(eval_dir: str, k: dict, idx: int, wf: dict,
             "ts": None,
         },
     }
+    if k.get("from_tuning_skillset"):
+        # Tuning produces kernel-selection/data-table optimizations too. Keep it
+        # in the ordinary kernels[] stream, with source metadata rather than a
+        # separate phase-level journey record.
+        entry["source_phase"] = "TuningSkillset"
+        entry["recovery_source"] = k.get("recovery_source") or "workflow_return"
+        entry["provisional"] = bool(k.get("provisional"))
+        entry["dispatch"]["task_group"] = "tuning_skillset"
+        entry["e2e"]["e2e_gain_scope"] = (
+            "single_tuning_kernel"
+            if k.get("e2e_delta_pct")
+            else "tuning_stack_unattributed"
+        )
+        entry["e2e"]["director_validated"] = False
+    return entry
 
 
 def _overlay_claim(ir: Any) -> dict | None:
