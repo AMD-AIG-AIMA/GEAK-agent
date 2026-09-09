@@ -373,7 +373,17 @@ def cmd_resolve(a) -> dict:
                 # its numbers and its hint, and an exact-workload record that has lost twice is still
                 # better evidence about THIS deployment than a coarse-rung record measured somewhere
                 # else. `demoted_by_hint == scanned` in the curation block is how a reader sees it.
-                out["curation"] = dict(curation, canonical_id=cid, tier=tier)
+                #
+                # FIRST rung that saw records wins the slot, not the last one to write it. The loop
+                # keeps descending — and on `both` keeps going to the mirror — and every empty rung
+                # after this one carries `scanned: 0`, so a plain assignment would hand the caller the
+                # emptiest page of the several that were read and bury the one that had something on
+                # it. On 20260907 that was the whole finding: the service's exact rung held one
+                # record that the floor filtered, and what came back described a page nobody had ever
+                # written to.
+                if not (out.get("curation") or {}).get("scanned"):
+                    out["curation"] = dict(curation, canonical_id=cid, tier=tier,
+                                           read_plane=read_plane)
                 continue
             views = views[: max(1, int(a.top_n))]
             # Attached per view, not as one flat list on `curation`: which record an alternate is an

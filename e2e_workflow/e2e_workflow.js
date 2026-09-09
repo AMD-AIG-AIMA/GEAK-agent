@@ -480,9 +480,33 @@ const E2E_STORE_SCRIPT = `${WORKFLOW_DIR}/scripts/e2e_store.py`;
 // here and once in interface/run_e2e.py (KB_IDENTITY_FILE), which is the same arrangement
 // workflow_return.json already has.
 const KB_IDENTITY_BASENAME = 'kb_identity.json';
-// Every candidate costs a full server launch to reject, so a recorded near-tie is not worth benching.
-const E2E_WARM_START_MIN_SPEEDUP = Number.isFinite(parseFloat(A.warm_start_min_speedup))
-  ? parseFloat(A.warm_start_min_speedup) : 1.05;
+// TWO questions, TWO floors. "Is this record worth KNOWING about" and "is this record worth a
+// 20-40min server launch" are different, and one number could not answer both: the read floor was
+// 1.05, so a stored 1.01x win never became a candidate at all — not a reference, not a line in the
+// tuning track's context, nothing. But a record's value is not its ratio. The one this dropped on
+// 20260907 (Qwen3.8-2.4T-A95B-Quark-MXFP4, exact rung, 1.0102x) carried the AITER fused-MoE tuning
+// table and the env var that binds it; the run that could not see it spent 8h24m rediscovering the
+// same seam from scratch. Reading is free, so the read floor now only drops records that LOST.
+//
+// Named with the `e2e_` prefix the layer's other warm-start budgets already use, because the floors
+// now differ from the kernel lane's (whose own `warm_start_min_speedup` still gates a verify slot at
+// 1.05 and is still forwarded verbatim by KB_ARGS) — one name with two meanings is how the next
+// reader concludes the wrong thing about which knob they turned. The bare name is still honoured so
+// a caller who set it to raise the e2e read floor keeps getting exactly that.
+const E2E_WARM_START_MIN_SPEEDUP = Number.isFinite(parseFloat(A.e2e_warm_start_min_speedup))
+  ? parseFloat(A.e2e_warm_start_min_speedup)
+  : Number.isFinite(parseFloat(A.warm_start_min_speedup))
+    ? parseFloat(A.warm_start_min_speedup) : 1.0;
+// The floor that spends money. A recorded near-tie is still not worth a launch to confirm: this
+// box's own session-to-session drift is the size of the claim (the 20260907 run re-measured its own
+// UNCHANGED baseline 3.5% low), so benching a 1.01x is a coin flip against the noise it would be
+// measured in. Below this, the offer stays a reference — which is the outcome the old single floor
+// was reaching for, minus the collateral damage to the read. Not applied to the kernel replay
+// below: an accepted-kernel entry carries its own ISOLATED speedup, a different quantity measured
+// on a different harness, and it is budgeted by E2E_WARM_START_KERNELS_N instead.
+const E2E_WARM_START_BENCH_MIN_SPEEDUP =
+  Number.isFinite(parseFloat(A.e2e_warm_start_bench_min_speedup))
+    ? parseFloat(A.e2e_warm_start_bench_min_speedup) : 1.02;
 
 // How a local verdict is filed AGAINST THE RECORD.
 //
@@ -777,6 +801,14 @@ const KB_RESOLVE_SCHEMA = obj({
   // is ranked by absolute throughput here but still promotes on speedup, and a reader told only
   // 'speedup' would mis-explain the order it is looking at.
   sorted_by: { type: 'string' }, champion_metric: { type: 'string' },
+  // Why a rung came back empty, in counts: `scanned` rows seen, of which `retired`,
+  // `same_direction_collapsed` and `below_min_speedup` were dropped. Listed here — rather than left
+  // to additionalProperties — because it is the ONLY thing that separates "nobody has recorded this
+  // deployment" from "the records are there and the floor ate them", and a field the schema does not
+  // name is a field the resolver agent feels free to summarise away.
+  // It carries its own `read_plane` too, which need not be the one that finally answered: on `both`
+  // the counts belong to the first rung that saw anything, and the read keeps descending past it.
+  curation: { type: 'object', additionalProperties: true },
 }, []);
 // Result of the standalone tuning-skillset phase. pre/post are ITS OWN in-session isolated-server A/B
 // legs (NOT the run baseline), which makes tuning_delta_pct an attributable share of the total gain.
@@ -2319,6 +2351,20 @@ if (want('setup')) {
         `sorted_by=${resolved.sorted_by || resolved.ranked_by || '-'} ` +
         `champion_metric=${resolved.champion_metric || '-'} reason=${resolved.read_reason || '?'} ` +
         `candidates=${cands.length}`);
+      // The counts BEHIND a zero. An empty offer has several very different causes — nobody wrote
+      // this page, everything on it was retracted, everything on it was under the read floor — and
+      // they are the same `candidates=0` to every reader who only gets the line above. Logged
+      // separately rather than folded into it so the line stays greppable when it is the boring case.
+      const curation = (resolved.curation && typeof resolved.curation === 'object') ? resolved.curation : {};
+      if (!cands.length && Number(curation.scanned) > 0) {
+        log(`[kb] the page was NOT empty: ${curation.scanned} record(s) scanned on plane ` +
+          `'${curation.read_plane || KB_READ_PLANE || '?'}' at ` +
+          `'${curation.canonical_id || resolved.canonical_id || '?'}' (tier ${curation.tier || '-'}), ` +
+          `all curated away — retired=${curation.retired || 0} ` +
+          `same_direction_collapsed=${curation.same_direction_collapsed || 0} ` +
+          `below_min_speedup=${curation.below_min_speedup || 0} (floor ${curation.min_speedup}). ` +
+          'This is a FLOOR result, not a cold deployment.');
+      }
       // Record the ASK before anything is benched. If this process dies mid-warm-start the report
       // still knows which ladder was queried, and on a zero-candidate read this is the entire
       // finding — see KB_RECALL's declaration for why the address matters more than the count.
@@ -2329,6 +2375,13 @@ if (want('setup')) {
         match_tier: String(resolved.match_tier || ''),
         plane: E2E_KB_PLANE, read_plane: KB_READ_PLANE, mode: E2E_WARM_START,
         candidates: cands.length, configs: [], kernels: [],
+        // Both floors, always — including on a read that returned everything it found. "Which
+        // records did this run decline to see, and at what threshold" is not answerable after the
+        // fact from a candidate list, and it is the first question asked when a later run finds a
+        // win that an earlier one walked past.
+        read_min_speedup: E2E_WARM_START_MIN_SPEEDUP,
+        bench_min_speedup: E2E_WARM_START_BENCH_MIN_SPEEDUP,
+        curation,
       };
       if (cands.length) KB_REF_DIR = refsDir;   // arms warmStartBlock() for the consumer roles
       // Armed on the same condition and never separately: the cache holds nothing until a candidate
@@ -2353,19 +2406,42 @@ if (want('setup')) {
       // fetch itself follow the rung metric belongs in e2e_store.resolve, not here.
       const benchOrder = exactTier ? cands : [...cands].sort(
         (x, y) => (Number(y.speedup) || 0) - (Number(x.speedup) || 0));
+      // The floor that spends money, applied HERE and not in the read (see
+      // E2E_WARM_START_BENCH_MIN_SPEEDUP). A record under it keeps everything that costs nothing —
+      // its place in the offer, its bundle in the cache, its paragraph in the Architect's and the
+      // tuning track's context — and loses only the launch. A record with no speedup recorded stays
+      // benchable, on the same reasoning the read floor uses: an unanswerable test is not a failed one.
+      const aboveBenchFloor = (c) =>
+        c.speedup == null || Number(c.speedup) >= E2E_WARM_START_BENCH_MIN_SPEEDUP;
+      const benchable = benchOrder.filter(aboveBenchFloor);
+      const belowBenchFloor = benchN ? benchOrder.filter(c => !aboveBenchFloor(c)) : [];
+      if (belowBenchFloor.length) {
+        log(`[kb] ${belowBenchFloor.length} offer(s) stay references, not benched: stored speedup ` +
+          `below the bench floor of ${E2E_WARM_START_BENCH_MIN_SPEEDUP}x — ` +
+          belowBenchFloor.map(c => `${String(c.session_id || '?').slice(-12)}=${c.speedup}x`).join(' ') +
+          '. A claim that size is this box\'s own drift; the config and any tuned artifact it ' +
+          'carries are still offered to the roles that can use them without a launch.');
+      }
       if (cands.length && !benchN) {
         log(`[kb] not benching: ${E2E_WARM_START_REF_ONLY
           ? (FAST_MODE ? 'fast mode — all optimization comes from the head track' : 'warm_start=reference')
           : `the caller set e2e_warm_start_validate_n_coarse=0 and match tier ` +
             `'${resolved.match_tier}' is not exact`}. The offers stay as references.`);
-      } else if (cands.length && !exactTier) {
-        log(`[kb] benching ${Math.min(benchN, cands.length)} of ${cands.length} offer(s) from coarse ` +
+      } else if (benchable.length && !exactTier) {
+        log(`[kb] benching ${Math.min(benchN, benchable.length)} of ${benchable.length} offer(s) from coarse ` +
           `tier '${resolved.match_tier}', picked by stored speedup. The stored throughput is not ` +
           `comparable to this baseline; the A/B below is measured on this box and is what counts.`);
       }
 
-      const verdicts = [];
-      for (const c of benchOrder.slice(0, benchN)) {
+      // Seeded with the records the bench floor declined, filed the same way as every other offer
+      // that reached no measurement here. `skipped` is outside the attestable set on purpose — the
+      // ledger counts what was TRIED on hardware, and this was not.
+      const verdicts = belowBenchFloor.map(c => ({
+        ...c, measured_tok_s: null, delta_pct: null, parity: 'n/a', outcome: 'skipped',
+        why: `stored speedup ${c.speedup}x is below the bench floor of ` +
+          `${E2E_WARM_START_BENCH_MIN_SPEEDUP}x — offered as a reference, not measured`,
+      }));
+      for (const c of benchable.slice(0, benchN)) {
         // VALIDATE THROUGH THE ORIGINAL GATE. This is config_tuner:sweep — the same role, the same
         // schema, the same bench_e2e.sh at the same TP/GPU, the same delta-vs-median arithmetic, the
         // same parity check and the same swap-took-effect log grep the flow already trusts for a
@@ -4919,7 +4995,9 @@ if (want('final')) {
       'built from KB_RECALL — see your role file. Write it even when nothing was recalled: report ' +
       'the exact canonical ids that were tried and the read_reason. On an exact-lookup store a miss ' +
       'and a never-recorded page are the same 404, so the address asked is the finding, and a reader ' +
-      'who cannot see it cannot tell "no prior art" from "prior art one segment away".', {
+      'who cannot see it cannot tell "no prior art" from "prior art one segment away". Zero candidates ' +
+      'is NOT the same as an empty page: report KB_RECALL.e2e.curation (scanned/retired/' +
+      'same_direction_collapsed/below_min_speedup, and its own read_plane) with both floors.', {
       EVAL_DIR, HISTORY: history, BASELINE_THROUGHPUT: BASELINE_TPUT, FINAL_THROUGHPUT: finalTput,
       KB_RECALL,
       ACCEPTED_CONFIG: { flags: curFlags, env: curEnv }, ACCEPTED_KERNELS: allAccepted,
