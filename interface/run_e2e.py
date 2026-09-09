@@ -2660,8 +2660,11 @@ def normalize_result(h: dict, wf: dict) -> dict:
     #   disk_intermediate_win  — best accepted integrate A/B (no final Validate).
     #   disk_no_gain_synthesis — baseline measured, nothing accepted (do-no-harm).
     checkpoint_level = str(wf.get("recovered_e2e_checkpoint_level") or "")
+    tuning_recovery_source = str(wf.get("recovered_tuning_source") or "")
     if checkpoint_level:
         result_source = f"disk_e2e_checkpoint_{checkpoint_level}"
+    elif tuning_recovery_source:
+        result_source = f"disk_tuning_skillset_{tuning_recovery_source}_provisional"
     elif wf.get("recovered_tuning_legacy"):
         result_source = "disk_tuning_skillset_legacy_provisional"
     elif wf.get("recovered_no_gain"):
@@ -3249,6 +3252,12 @@ def _tuning_skillset_section(wf: dict, eval_dir: Path) -> dict | None:
         "engagement_evidence": t.get("engagement_evidence") or "",
         "report_path": t.get("report_path") or str(eval_dir / "tuning" / "tuning_report.md"),
     }
+
+    if t.get("recovered"):
+        section["recovery"] = {
+            "source": t.get("recovery_source") or "unknown",
+            "provisional": True,
+        }
 
     if accepted:
         section["artifacts"] = t.get("artifacts") or []
@@ -4090,6 +4099,277 @@ def _legacy_tuning_kernels(manifest: dict) -> list[dict]:
     return kernels
 
 
+def _tuning_recovery_overlay(eval_dir: Path, tuning: dict) -> str | None:
+    """Return a live tuning overlay only when it belongs to this evaluation."""
+    raw = str(tuning.get("apply_overlay") or "").strip()
+    if not raw:
+        return ""
+    try:
+        path = Path(raw)
+        candidate = path.resolve() if path.is_absolute() else (eval_dir / path).resolve()
+        candidate.relative_to(eval_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return str(candidate) if candidate.is_dir() else None
+
+
+def _write_tuning_recovery_launcher(eval_dir: Path) -> str:
+    """Write the executable replay bridge for a data-only tuning deployment."""
+    tuning_dir = eval_dir / "tuning"
+    deploy_script = tuning_dir / "deploy" / "deploy.sh"
+    bench_script = eval_dir / "bench_e2e.sh"
+    launcher = tuning_dir / "recovery_launch.sh"
+    if not deploy_script.is_file() or not bench_script.is_file():
+        return ""
+    content = """#!/usr/bin/env bash
+set -euo pipefail
+OUT_DIR="${1:?expected Hyperloom output directory}"
+export OUT_DIR
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+export GEAK_TUNING_ENV_OUT="$HERE/deploy/apply_env.sh"
+bash "$HERE/deploy/deploy.sh"
+if [[ -s "$GEAK_TUNING_ENV_OUT" ]]; then
+  # shellcheck disable=SC1090
+  source "$GEAK_TUNING_ENV_OUT"
+fi
+exec bash "$ROOT/bench_e2e.sh"
+"""
+    try:
+        if not launcher.is_file() or launcher.read_text(encoding="utf-8") != content:
+            launcher.write_text(content, encoding="utf-8")
+            launcher.chmod(0o755)
+        return str(launcher)
+    except OSError:
+        return ""
+
+
+def _recovered_tuning_material(
+    tuning: dict,
+    eval_dir: Path,
+    speedup: float,
+    *,
+    source: str,
+) -> list[dict]:
+    """Describe recovered tuning data as replay material without inventing code."""
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for op in tuning.get("ops_tuned") or []:
+        if not isinstance(op, dict) or op.get("engaged") is not True:
+            continue
+        isolated = _positive_finite_float(op.get("isolated_speedup"))
+        name = str(op.get("op") or "").strip()
+        artifact = str(op.get("artifact") or "").strip()
+        disposition = " ".join(
+            str(op.get(key) or "")
+            for key in ("op", "note", "status", "decision", "gate")
+        )
+        if (
+            isolated <= 1.0
+            or not name
+            or re.search(r"\b(?:rejected|superseded|do not re-apply|do not apply)\b",
+                         disposition, re.IGNORECASE)
+        ):
+            continue
+        identity = artifact or name
+        if identity in seen:
+            continue
+        seen.add(identity)
+        rows.append(
+            {
+                "short_name": name,
+                "op_kind": "tuning_data_deployment",
+                "backend": op.get("backend") or "tuning_skillset",
+                "artifact": artifact,
+                "isolated": isolated,
+                "e2e_delta_pct": round((speedup - 1.0) * 100.0, 4),
+                "from_tuning_skillset": True,
+                "recovery_source": source,
+                "provisional": True,
+            }
+        )
+    if rows:
+        return rows
+    return [
+        {
+            "short_name": "tuning_data_deployment",
+            "op_kind": "tuning_data_deployment",
+            "backend": "tuning_skillset",
+            "artifact": str(eval_dir / "tuning" / "deploy"),
+            "e2e_delta_pct": round((speedup - 1.0) * 100.0, 4),
+            "from_tuning_skillset": True,
+            "recovery_source": source,
+            "provisional": True,
+        }
+    ]
+
+
+def _tuning_recovery_return(
+    eval_dir: Path,
+    tuning: dict,
+    *,
+    pre: float,
+    post: float,
+    source: str,
+    report_path: Path | None = None,
+) -> dict | None:
+    """Build a workflow-return-shaped provisional tuning recovery."""
+    launcher = _write_tuning_recovery_launcher(eval_dir)
+    overlay = _tuning_recovery_overlay(eval_dir, tuning)
+    if not launcher or overlay is None:
+        return None
+    speedup = post / pre
+    recovered_tuning = dict(tuning)
+    recovered_tuning.update(
+        {
+            "enabled": True,
+            "ran": True,
+            "gate": "accepted",
+            "pre_tune_throughput_tok_s": pre,
+            "post_tune_throughput_tok_s": post,
+            "tuning_speedup": speedup,
+            "recovered": True,
+            "recovery_source": source,
+            "deploy_bundle": str(eval_dir / "tuning" / "deploy"),
+        }
+    )
+    if report_path is not None:
+        recovered_tuning["report_path"] = str(report_path)
+    return {
+        "eval_dir": str(eval_dir),
+        "throughput_speedup": speedup,
+        "baseline_throughput_tok_s": pre,
+        "final_throughput_tok_s": post,
+        "output_parity": tuning.get("correctness_gate") or "unknown",
+        "final_overlay": overlay,
+        "final_launch_script": launcher,
+        "accepted_config": {
+            "flags": str(tuning.get("apply_flags") or ""),
+            "env": str(tuning.get("apply_env") or ""),
+        },
+        "accepted_kernels": _recovered_tuning_material(
+            tuning, eval_dir, speedup, source=source
+        ),
+        "accepted_heads": [],
+        "tuning_skillset": recovered_tuning,
+        "validation_status": f"recovered_tuning_skillset_{source}",
+        "recovered_from_disk": True,
+        "recovered_intermediate": True,
+        "recovered_tuning_source": source,
+        "recovery_evidence": {
+            "source": source,
+            "source_path": (
+                "tuning/tuning_result.json"
+                if source == "tuning_result"
+                else "tuning/tuning_report.md"
+            ),
+            "deploy_script": "tuning/deploy/deploy.sh",
+            "pre_tune_throughput_tok_s": pre,
+            "post_tune_throughput_tok_s": post,
+            "tuning_speedup": speedup,
+            "provisional": True,
+        },
+    }
+
+
+def _recover_tuning_result(eval_dir: Path) -> dict | None:
+    """Recover a formally accepted tuning skillset result without re-benchmarking."""
+    source = eval_dir / "tuning" / "tuning_result.json"
+    tuning = _read_json(source)
+    if not tuning:
+        return None
+    pre = _positive_finite_float(tuning.get("pre_tune_throughput_tok_s"))
+    post = _positive_finite_float(tuning.get("post_tune_throughput_tok_s"))
+    claimed_speedup = _positive_finite_float(tuning.get("tuning_speedup"))
+    actual_speedup = post / pre if pre > 0.0 else 0.0
+    if not (
+        tuning.get("ran") is True
+        and str(tuning.get("gate") or "").lower() == "accepted"
+        and tuning.get("engagement_verified") is True
+        and tuning.get("ab_complete") is True
+        and str(tuning.get("correctness_gate") or "").lower() != "fail"
+        and pre > 0.0
+        and post > pre
+        and claimed_speedup > 1.0
+        and math.isclose(
+            claimed_speedup, actual_speedup, rel_tol=SPEEDUP_SELF_CONSISTENCY_TOL
+        )
+    ):
+        return None
+    return _tuning_recovery_return(
+        eval_dir, tuning, pre=pre, post=post, source="tuning_result"
+    )
+
+
+_REPORT_ACCEPTED_GATE_RE = re.compile(
+    r"(?im)^\s*(?:#+\s*(?:\d+\.\s*)?)?(?:\*\*)?\s*"
+    r"(?:outcome|gate)\s*:\s*`?\s*accepted\b"
+)
+_REPORT_OUTCOME_PAIR_RE = re.compile(
+    r"\(\s*([0-9]+(?:\.[0-9]+)?)\s*(?:→|->)\s*"
+    r"([0-9]+(?:\.[0-9]+)?)\s*tok/s\s*\)",
+    re.IGNORECASE,
+)
+_REPORT_LABELED_PAIR_RE = re.compile(
+    r"\bpre\b[^=\n]{0,80}=\s*([0-9]+(?:\.[0-9]+)?)\s*tok/s"
+    r"[\s·,;|]*\bpost\b[^=\n]{0,80}=\s*"
+    r"([0-9]+(?:\.[0-9]+)?)\s*tok/s",
+    re.IGNORECASE,
+)
+_REPORT_SPEEDUP_RE = re.compile(
+    r"\bspeedup\s*(?:=|:)?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:x|×)",
+    re.IGNORECASE,
+)
+
+
+def _recover_tuning_report(eval_dir: Path) -> dict | None:
+    """Recover an accepted historical tuning report without scanning A/B legs."""
+    report = eval_dir / "tuning" / "tuning_report.md"
+    if not report.is_file():
+        return None
+    try:
+        text = report.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not _REPORT_ACCEPTED_GATE_RE.search(text):
+        return None
+    pair = _REPORT_OUTCOME_PAIR_RE.search(text) or _REPORT_LABELED_PAIR_RE.search(text)
+    if pair is None:
+        return None
+    pre = _positive_finite_float(pair.group(1))
+    post = _positive_finite_float(pair.group(2))
+    speedup = post / pre if pre > 0.0 else 0.0
+    claimed = _REPORT_SPEEDUP_RE.search(text)
+    if (
+        pre <= 0.0
+        or post <= pre
+        or speedup <= 1.0
+        or (
+            claimed is not None
+            and not math.isclose(
+                _positive_finite_float(claimed.group(1)),
+                speedup,
+                rel_tol=SPEEDUP_SELF_CONSISTENCY_TOL,
+            )
+        )
+    ):
+        return None
+    tuning = {
+        "engagement_verified": True,
+        "ab_complete": True,
+        "correctness_gate": "unknown",
+        "report_path": str(report),
+    }
+    return _tuning_recovery_return(
+        eval_dir,
+        tuning,
+        pre=pre,
+        post=post,
+        source="markdown_report",
+        report_path=report,
+    )
+
+
 def _legacy_tuning_summary_is_accepted(summary: dict) -> bool:
     """Validate the archived tuning A/B acceptance evidence conservatively."""
     if (
@@ -4309,6 +4589,9 @@ def _recover_tuning_legacy_composite(eval_dir: Path) -> dict | None:
     deploy_script = eval_dir / "tuning" / "deploy" / "deploy.sh"
     if not manifest or not deploy_script.is_file():
         return None
+    recovery_launcher = _write_tuning_recovery_launcher(eval_dir)
+    if not recovery_launcher:
+        return None
     baseline = final = 0.0
     evidence_source = "tuning/ab/ab_summary.json"
     if summary:
@@ -4348,7 +4631,7 @@ def _recover_tuning_legacy_composite(eval_dir: Path) -> dict | None:
         "flags": str(manifest.get("apply_flags") or ""),
         "env": str(manifest.get("apply_env") or _legacy_manifest_env(manifest)),
     }
-    final_launch_script = str(deploy_script)
+    final_launch_script = recovery_launcher
     evidence = {
         "summary_path": evidence_source,
         "deploy_manifest_path": "tuning/deploy/MANIFEST.json",
@@ -4423,13 +4706,21 @@ def _recover_workflow_return(exp_root: Path) -> dict | None:
         # (run killed mid-Validate, or torn down before it wrote). Recover in
         # priority order so a COMPLETED run is NEVER discarded as a parse error:
         #   1. a schema-v2 committed checkpoint,
-        #   2. a legacy tuning composite with engagement evidence,
-        #   3. the best gate==accepted intermediate win (a real measured gain),
-        #   4. else, if a baseline was measured but nothing was accepted, a
+        #   2. a formally accepted tuning_result.json,
+        #   3. an accepted historical tuning report,
+        #   4. legacy structured tuning evidence,
+        #   5. the best gate==accepted intermediate win (a real measured gain),
+        #   6. else, if a baseline was measured but nothing was accepted, a
         #      legitimate NO_GAIN run (the optimizer correctly did no harm).
         checkpoint_win = _recover_e2e_validation_checkpoint(eval_dir)
         if checkpoint_win is not None:
             return checkpoint_win
+        tuning_result_win = _recover_tuning_result(eval_dir)
+        if tuning_result_win is not None:
+            return tuning_result_win
+        tuning_report_win = _recover_tuning_report(eval_dir)
+        if tuning_report_win is not None:
+            return tuning_report_win
         tuning_win = _recover_tuning_legacy_composite(eval_dir)
         if tuning_win is not None:
             return tuning_win

@@ -86,6 +86,14 @@ def _write(eval_dir: Path, relative: str, checkpoint: dict) -> None:
     path.write_text(json.dumps(checkpoint), encoding="utf-8")
 
 
+def _tuning_recovery_runtime(eval_dir: Path) -> Path:
+    deploy = eval_dir / "tuning" / "deploy"
+    deploy.mkdir(parents=True)
+    (deploy / "deploy.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (eval_dir / "bench_e2e.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    return deploy
+
+
 def test_recovers_tuning_checkpoint_and_preserves_kernel_metadata(tmp_path):
     eval_dir = tmp_path / "e2e"
     checkpoint = _checkpoint(eval_dir, "tuning_skillset")
@@ -233,11 +241,136 @@ def test_checkpoint_parent_chain_must_match_the_parent_document(tmp_path):
     assert reason == "parent checkpoint digest mismatch"
 
 
+def test_recovers_accepted_tuning_result_with_replay_launcher(tmp_path):
+    eval_dir = tmp_path / "e2e_interrupted"
+    _tuning_recovery_runtime(eval_dir)
+    result = {
+        "ran": True,
+        "gate": "accepted",
+        "engagement_verified": True,
+        "ab_complete": True,
+        "correctness_gate": "pass",
+        "pre_tune_throughput_tok_s": 1000.0,
+        "post_tune_throughput_tok_s": 1100.0,
+        "tuning_speedup": 1.1,
+        "apply_flags": "--use-tuned-table",
+        "apply_env": "AITER_TUNED=1",
+        "ops_tuned": [{
+            "op": "dense_gemm",
+            "backend": "aiter",
+            "artifact": "tuning/deploy/files/gemm.csv",
+            "engaged": True,
+            "isolated_speedup": 1.2,
+        }, {
+            "op": "dense_gemm_alias",
+            "backend": "aiter",
+            "artifact": "tuning/deploy/files/gemm.csv",
+            "engaged": True,
+            "isolated_speedup": 1.2,
+        }, {
+            "op": "old_gemm",
+            "backend": "aiter",
+            "artifact": "tuning/deploy_round1/files/gemm.csv",
+            "engaged": True,
+            "isolated_speedup": 1.2,
+            "note": "SUPERSEDED by the deployed table",
+        }],
+    }
+    path = eval_dir / "tuning" / "tuning_result.json"
+    path.write_text(json.dumps(result), encoding="utf-8")
+    (eval_dir / "tuning" / "tuning_report.md").write_text(
+        "**Outcome: accepted.** (900 -> 1200 tok/s)", encoding="utf-8"
+    )
+
+    recovered = rx._recover_workflow_return(tmp_path)
+    normalized = rx.normalize_result({}, recovered)
+    launcher = Path(recovered["final_launch_script"])
+
+    assert recovered["recovered_tuning_source"] == "tuning_result"
+    assert recovered["baseline_throughput_tok_s"] == 1000.0
+    assert recovered["final_throughput_tok_s"] == 1100.0
+    assert recovered["accepted_kernels"][0]["short_name"] == "dense_gemm"
+    assert len(recovered["accepted_kernels"]) == 1
+    assert launcher.is_file()
+    assert launcher.stat().st_mode & 0o111
+    assert 'bash "$HERE/deploy/deploy.sh"' in launcher.read_text(encoding="utf-8")
+    assert 'exec bash "$ROOT/bench_e2e.sh"' in launcher.read_text(encoding="utf-8")
+    assert normalized["status"] == "ok"
+    assert normalized["result_source"] == "disk_tuning_skillset_tuning_result_provisional"
+    assert normalized["validation_evidence"]["recovery"]["source"] == "tuning_result"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("gate", "no_win"),
+        ("engagement_verified", False),
+        ("ab_complete", False),
+        ("correctness_gate", "fail"),
+        ("tuning_speedup", 1.2),
+    ],
+)
+def test_tuning_result_recovery_rejects_incomplete_or_inconsistent_gates(tmp_path, field, value):
+    eval_dir = tmp_path / "e2e_interrupted"
+    _tuning_recovery_runtime(eval_dir)
+    result = {
+        "ran": True,
+        "gate": "accepted",
+        "engagement_verified": True,
+        "ab_complete": True,
+        "correctness_gate": "pass",
+        "pre_tune_throughput_tok_s": 1000.0,
+        "post_tune_throughput_tok_s": 1100.0,
+        "tuning_speedup": 1.1,
+    }
+    result[field] = value
+    (eval_dir / "tuning" / "tuning_result.json").write_text(
+        json.dumps(result), encoding="utf-8"
+    )
+
+    assert rx._recover_tuning_result(eval_dir) is None
+
+
+def test_recovers_accepted_tuning_markdown_report_without_ab_scan(tmp_path):
+    eval_dir = tmp_path / "e2e_interrupted"
+    _tuning_recovery_runtime(eval_dir)
+    report = eval_dir / "tuning" / "tuning_report.md"
+    report.write_text(
+        "**Outcome: accepted.** +1.29% e2e output throughput "
+        "(2644.24 → 2678.23 tok/s) against a noise band.\n",
+        encoding="utf-8",
+    )
+    stale_leg = eval_dir / "tuning" / "ab" / "pre_n1"
+    stale_leg.mkdir(parents=True)
+    (stale_leg / "bench_summary.json").write_text(
+        json.dumps({"throughput_tok_s_median": 1}), encoding="utf-8"
+    )
+
+    recovered = rx._recover_workflow_return(tmp_path)
+    normalized = rx.normalize_result({}, recovered)
+
+    assert recovered["recovered_tuning_source"] == "markdown_report"
+    assert recovered["baseline_throughput_tok_s"] == 2644.24
+    assert recovered["final_throughput_tok_s"] == 2678.23
+    assert recovered["accepted_kernels"][0]["op_kind"] == "tuning_data_deployment"
+    assert normalized["result_source"] == "disk_tuning_skillset_markdown_report_provisional"
+    assert normalized["validation_evidence"]["recovery"]["provisional"] is True
+
+
+def test_tuning_markdown_recovery_requires_explicit_accepted_gate(tmp_path):
+    eval_dir = tmp_path / "e2e_interrupted"
+    _tuning_recovery_runtime(eval_dir)
+    (eval_dir / "tuning" / "tuning_report.md").write_text(
+        "## 8. Gate: `no_win`\npre = 1000 tok/s; post = 1100 tok/s\n",
+        encoding="utf-8",
+    )
+
+    assert rx._recover_tuning_report(eval_dir) is None
+
+
 def test_recovers_legacy_tuning_composite_as_provisional(tmp_path):
     eval_dir = tmp_path / "e2e_interrupted"
-    deploy = eval_dir / "tuning" / "deploy"
-    deploy.mkdir(parents=True)
-    (deploy / "deploy.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    deploy = _tuning_recovery_runtime(eval_dir)
     (deploy / "MANIFEST.json").write_text(json.dumps({
         "apply_env": "AITER_CONFIG=/tmp/gemm.csv",
         "ops_tuned": [{
@@ -274,9 +407,7 @@ def test_recovers_legacy_tuning_composite_as_provisional(tmp_path):
 
 def test_recovers_legacy_tuning_from_three_raw_isolated_pairs(tmp_path):
     eval_dir = tmp_path / "e2e_interrupted"
-    deploy = eval_dir / "tuning" / "deploy"
-    deploy.mkdir(parents=True)
-    (deploy / "deploy.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    deploy = _tuning_recovery_runtime(eval_dir)
     (deploy / "MANIFEST.json").write_text(
         json.dumps({"apply_env": "AITER_CONFIG=/tmp/gemm.csv"}), encoding="utf-8"
     )
@@ -306,9 +437,7 @@ def test_recovers_legacy_tuning_from_three_raw_isolated_pairs(tmp_path):
 
 def test_verified_legacy_final_pair_outranks_tuning_and_checks_engagement(tmp_path):
     eval_dir = tmp_path / "e2e_interrupted"
-    deploy = eval_dir / "tuning" / "deploy"
-    deploy.mkdir(parents=True)
-    (deploy / "deploy.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    deploy = _tuning_recovery_runtime(eval_dir)
     env = {"AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE": "/tmp/tuned.csv"}
     (deploy / "MANIFEST.json").write_text(json.dumps({"extra_env": env}), encoding="utf-8")
     ab = eval_dir / "tuning" / "ab"
