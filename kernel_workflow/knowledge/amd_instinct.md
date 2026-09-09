@@ -1,8 +1,14 @@
-# AMD Instinct (MI-series) Hardware Reference — DETECT THE BOX FIRST
+# AMD GPU Hardware Reference — DETECT THE BOX FIRST
 
-This workflow runs on AMD Instinct MI-series accelerators — **CDNA 3** (MI300X / MI300A / MI308X /
-MI325X, `gfx942`) and **CDNA 4** (MI350X / MI355X, `gfx950`). They differ in CU count, HBM bandwidth,
-peak FLOPS, and — critically for quantized kernels — the **fp8 number format**. Do NOT assume MI300X.
+This workflow primarily runs on AMD Instinct MI-series accelerators — **CDNA 3** (MI300X / MI300A /
+MI308X / MI325X, `gfx942`) and **CDNA 4** (MI350X / MI355X, `gfx950`). They differ in CU count, HBM
+bandwidth, peak FLOPS, and — critically for quantized kernels — the **fp8 number format**. Do NOT
+assume MI300X.
+
+It also runs on **RDNA 3.5** client parts (`gfx1151`, Radeon 8060S in the Strix Halo APU). That is a
+different architecture family, not a smaller MI card: wave32 instead of wave64, WMMA instead of MFMA,
+no AGPR file, no fp8 matrix path, and LPDDR shared with the CPU instead of HBM. **§2 below is CDNA
+only** — read §2b instead when the box is `gfx11*`. Sections that say "CDNA" mean it literally.
 
 ## 0. Detect THIS box first (source of truth > this table)
 Always identify the actual accelerator at the start of analysis/profiling, and prefer the detected
@@ -32,6 +38,14 @@ rocm-smi --showmeminfo vram 2>/dev/null | head              # HBM capacity
 | MI325X  | CDNA3 / `gfx942`  | 304     | 256 GB  | ~6.0 TB/s  | **FNUZ**   | no           |
 | MI350X  | CDNA4 / `gfx950`  | 256     | 288 GB  | ~8 TB/s    | **OCP**    | **yes**      |
 | MI355X  | CDNA4 / `gfx950`  | 256     | 288 GB  | ~8 TB/s    | **OCP**    | **yes**      |
+| Radeon 8060S | RDNA3.5 / `gfx1151` | 40 | unified | **~0.26 TB/s** | **none** | no |
+
+The 8060S row is not a typo: an APU has **~20–30× less bandwidth per FLOP** than an MI card, so ops
+that are compute-bound on MI300X are usually memory-bound there. Its memory is a BIOS-configured
+slice of system LPDDR5X shared with the CPU, not a fixed VRAM pool, and there is a 32 MiB Infinity
+Cache tier between the 2 MiB L2 and DRAM that no CDNA part has. `gfx1151` also covers the 8050S
+(32 CU) and 8040S (16 CU) — same arch string, up to 2.5× less compute, so `rocminfo` is the only
+authority on CU count.
 
 CU counts/BW are nameplate and vary by SKU/firmware (MI308X is a reduced-CU variant) — `rocminfo` is
 authoritative. CDNA4 (gfx950) is a large generational step up in matrix throughput over CDNA3 and adds
@@ -59,6 +73,45 @@ native FP6/FP4 — do NOT carry MI300X compute peaks onto it; look it up or meas
 | 256         | 1              | 12.5%     |
 
 Prefer `__launch_bounds__(max_threads, min_waves)` to steer register allocation.
+
+## 2b. RDNA 3.5 (`gfx1151`) — where §2 does NOT apply
+
+Every line here contradicts §2 by an integer factor, not by a few percent. If the box is `gfx11*`,
+this section replaces §2 rather than qualifying it.
+
+| | CDNA (§2) | RDNA3.5 (`gfx1151`) |
+|---|---|---|
+| Wavefront | 64 lanes, `__ballot` → 64-bit | **32 lanes**, `__ballot` → **32-bit** |
+| Matrix ISA | MFMA | **WMMA** (`v_wmma_*`), bf16/fp16/iu8/iu4 only |
+| fp8 matrix path | yes (fnuz on gfx942, OCP on gfx950) | **none** — fp8 WMMA starts at RDNA4 |
+| Register file | 512 VGPR/SIMD, arch+**AGPR combined** | **1536 VGPR/SIMD, no AGPR file**; 256 addressable per wave |
+| VGPR granule / waves | granule 8, ≤8 waves/SIMD | **granule 24, ≤16 waves/SIMD** |
+| SIMDs | 4 per CU | **2 per CU** (CUs pair into a WGP) |
+| LDS | 64 KB per CU | **128 KB per WGP**, 64 KB max per workgroup |
+| Memory | HBM, GPU-private | **LPDDR5X, shared with the CPU** |
+| Dies | multi-XCD on MI300X-class | **single die, no XCD** |
+
+Consequences that bite in practice:
+
+- **Do not apply the §2 occupancy table.** It is wave64/512-VGPR/cap-8. Using it here under-reports
+  occupancy by 2–3× (249 VGPRs is 5 waves/SIMD on RDNA, not 1). The authoritative per-arch table is
+  `perf_knowledge/expert_skills/skills/gluon_authoring/references/hardware/hw_constants.json`; query
+  it with `scripts/amd_occupancy.py --vgpr N --arch gfx1151`.
+- **The same tile costs twice the VGPR per lane** at wave32, because half as many lanes share it.
+- **`matrix_instr_nonkdim` and `kpack` are CDNA-only Triton knobs** — no-ops or errors here. MFMA
+  shape advice (§3) does not transfer; there is no MFMA hardware counter to profile either.
+- **The backend ladder still exists here — probe it, do not infer it from the arch.** aiter, CK and
+  hipBLASLt all build for gfx11, and hipBLASLt is *tuned* for it: a ROCm 7.2.3 install ships 47
+  `TensileLibrary_*_gfx1151.dat` solution libraries (555 for gfx942 in the same install). What
+  differs per install is coverage, so list what is actually there
+  (`ls $ROCM_PATH/lib/hipblaslt/library | grep -c "gfx<arch>\.dat"`) instead of dropping rungs on
+  architecture grounds.
+- **No LDS-per-CU number is defined** — shared memory is per-WGP with a lower per-workgroup cap, so
+  `amd_occupancy.lds_per_cu("gfx1151")` returns `None` on purpose. Read `lds_per_wgp_kib` and
+  `lds_per_wg_kib` separately; do not synthesise a per-CU figure.
+- **Roofline denominators** are in
+  `e2e_workflow/knowledge/analysis_skills/roofline/peaks.md` (`gfx1151` section). That row carries
+  the memory axis only — no compute peaks are tabulated for this part, so rank on `hbm_util`.
 
 ## 3. Arch-specific: dtype, fp8 format, MFMA (gfx942 vs gfx950)
 **This is the part you MUST branch on `gfx`** — picking the wrong fp8 format silently fails correctness.

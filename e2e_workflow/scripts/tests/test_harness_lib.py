@@ -580,8 +580,36 @@ class TestArch(_HarnessTestCase):
             self.assertTrue(hl.fp8_is_fnuz(arch), arch)
 
     def test_cdna4_and_unknown_archs_use_the_ocp_fp8(self):
-        for arch in ("gfx950", "gfx1100", "", None):
+        for arch in ("gfx950", "gfx1100", "gfx1151", "", None):
             self.assertFalse(hl.fp8_is_fnuz(arch), arch)
+
+
+# --------------------------------------------------------------------------- #
+# has_native_fp8 -- WHETHER an fp8 matrix path exists, which fp8_is_fnuz cannot say
+# --------------------------------------------------------------------------- #
+class TestHasNativeFp8(_HarnessTestCase):
+    def test_cdna3_and_cdna4_have_an_fp8_matrix_path(self):
+        for arch in ("gfx942", "gfx942:sramecc+", "gfx940", "gfx941", "gfx950", "GFX950"):
+            self.assertTrue(hl.has_native_fp8(arch), arch)
+
+    def test_rdna3_and_pre_fp8_cdna_do_not(self):
+        """gfx1151 (Strix Halo) is the case this was added for: WMMA on RDNA3.5 does bf16/fp16/iu8
+        and no fp8, while torch still hands out float8_e4m3fn as a storage dtype -- so nothing else
+        in the stack would have noticed."""
+        for arch in ("gfx1151", "gfx1100", "gfx1030", "gfx908", "gfx90a", "GFX1151"):
+            self.assertFalse(hl.has_native_fp8(arch), arch)
+
+    def test_unknown_arch_is_assumed_to_have_fp8(self):
+        """Deliberately optimistic: silently stripping a user's fp8 regime on an arch this table has
+        not heard of is a worse failure than benchmarking a path that turns out to be slow."""
+        for arch in ("gfx9999", "gfx1250", "", None):
+            self.assertTrue(hl.has_native_fp8(arch), arch)
+
+    def test_it_is_independent_of_the_fnuz_answer(self):
+        """gfx90a is in BOTH prefix tables -- fnuz says which format a software path would use,
+        has_native_fp8 says no matrix path exists. Both are correct and they do not contradict."""
+        self.assertTrue(hl.fp8_is_fnuz("gfx90a"))
+        self.assertFalse(hl.has_native_fp8("gfx90a"))
 
 
 # --------------------------------------------------------------------------- #

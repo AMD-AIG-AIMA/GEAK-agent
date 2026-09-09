@@ -84,10 +84,24 @@ _DTYPE_BYTES = {
 }
 
 # CDNA3 (MI300/MI325, gfx942) + gfx90a use the AMD-only "fnuz" fp8 (no-inf/unsigned-zero). CDNA4
-# (MI355, gfx950) moved to the OCP-standard fp8 (e4m3fn/e5m2), same as NVIDIA. So the fp8 NUMERIC
-# FORMAT is the ONE hardware-specific axis: a bare "fp8"/"fp8_e4m3" must resolve to the arch's variant,
-# not a hardcoded fnuz. An EXPLICIT ...fnuz/...fn (e.g. from a pre-quantized checkpoint's config) wins.
+# (MI355, gfx950) moved to the OCP-standard fp8 (e4m3fn/e5m2), same as NVIDIA. Within the CDNA3/CDNA4
+# pair the fp8 NUMERIC FORMAT is the only hardware axis that matters here: a bare "fp8"/"fp8_e4m3"
+# must resolve to the arch's variant, not a hardcoded fnuz. An EXPLICIT ...fnuz/...fn (e.g. from a
+# pre-quantized checkpoint's config) wins.
+#
+# It is NOT the only hardware axis across AMD GPUs generally -- on RDNA the wave width, the matrix ISA
+# (WMMA vs MFMA), the register file and the LDS topology all differ too. See has_native_fp8 below for
+# the axis that CDNA3-vs-CDNA4 does not expose: whether an fp8 matrix path exists at all.
 _FNUZ_ARCH_PREFIXES = ("gfx940", "gfx941", "gfx942", "gfx90a")
+
+# Archs with NO fp8 matrix path. Longest-prefix-free: plain startswith is enough because no listed
+# prefix is a prefix of an unlisted supported arch.
+#   gfx908 (CDNA1) / gfx90a (CDNA2)  -- MFMA predates fp8 entirely.
+#   gfx10* / gfx11* (RDNA1-3.5)      -- WMMA has bf16/fp16/iu8/iu4 only; fp8 WMMA arrives with RDNA4.
+# gfx90a appears here AND in _FNUZ_ARCH_PREFIXES above: MI200 has no fp8 unit, so the fnuz answer for
+# it is about which format a SOFTWARE path would use, not about a matrix path that exists. Left as-is
+# rather than "fixed", because callers of fp8_is_fnuz depend on the current answer.
+_NO_NATIVE_FP8_ARCH_PREFIXES = ("gfx908", "gfx90a", "gfx10", "gfx11")
 
 
 def detect_arch(torch=None):
@@ -102,9 +116,28 @@ def detect_arch(torch=None):
 
 
 def fp8_is_fnuz(arch):
-    """True if this arch uses the AMD fnuz fp8 (CDNA3/gfx942); False for CDNA4/OCP (gfx950) and others."""
+    """True if this arch uses the AMD fnuz fp8 (CDNA3/gfx942); False for CDNA4/OCP (gfx950) and others.
+
+    Answers WHICH fp8 format, not WHETHER fp8 exists -- see has_native_fp8 for that."""
     a = (arch or "").lower()
     return any(a.startswith(p) for p in _FNUZ_ARCH_PREFIXES)
+
+
+def has_native_fp8(arch):
+    """True if this arch has an fp8 MATRIX path (gfx942 fnuz, gfx950 OCP, RDNA4+); False for the
+    parts that have none (CDNA1/2, RDNA1-3.5 -- e.g. gfx1151 / Strix Halo).
+
+    This is the gap fp8_is_fnuz cannot express. torch exposes float8_e4m3fn as a STORAGE dtype on
+    every ROCm build, so a bare "fp8" regime on gfx1151 allocates and runs happily -- against an
+    emulated path, at a fraction of the bf16 rate. Benchmarking that and reporting it as an fp8
+    result is the failure this guards: preflight should DROP fp8 regimes when this is False rather
+    than measure emulation.
+
+    Unknown/new archs answer True. A part this table has not heard of is far more likely to be a new
+    accelerator that has fp8 than a new one that does not, and silently stripping a user's fp8 regime
+    is a worse failure than benchmarking a path that turns out to be slow."""
+    a = (arch or "").lower()
+    return not any(a.startswith(p) for p in _NO_NATIVE_FP8_ARCH_PREFIXES)
 
 
 def regime_dtype(name, torch=None, arch=None):

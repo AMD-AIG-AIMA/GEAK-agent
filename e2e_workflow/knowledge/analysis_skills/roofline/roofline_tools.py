@@ -303,6 +303,12 @@ def classify_headroom(roofline_pct, target_eff):
 #: rocprofv3 counters to request. FETCH_SIZE/WRITE_SIZE are in KiB. fp8 has no MfmaFlopsF8 on
 #: current builds -- SQ_INSTS_VALU_MFMA_MOPS_F8 stands in. Availability varies by ROCm build;
 #: probe with `rocprofv3 --list-avail` and drop whatever is missing (degrades to L4, never fatal).
+#:
+#: EVERY Mfma* NAME HERE IS CDNA-ONLY. On RDNA (gfx11*/gfx12*) the matrix unit is WMMA and these
+#: counters do not exist at all, so the drop-what-is-missing rule above removes the entire compute
+#: axis and stage C yields bytes only. That is the correct outcome -- an absent counter is not a
+#: zero -- but do not read "MfmaUtil missing" as "the matrix unit was idle". The memory axis
+#: (FETCH_SIZE/WRITE_SIZE/MemUnitStalled/OccupancyPercent) is portable and is what to rank on there.
 COUNTERS = ["FETCH_SIZE", "WRITE_SIZE", "MfmaFlops", "MfmaFlopsBF16", "MfmaFlopsF16",
             "SQ_INSTS_VALU_MFMA_MOPS_F8", "MemUnitStalled", "MfmaUtil", "OccupancyPercent"]
 

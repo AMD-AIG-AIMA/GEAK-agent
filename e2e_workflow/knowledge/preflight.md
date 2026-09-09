@@ -20,6 +20,12 @@
 - **Adapt the plan to what you find.** Capability detected here flows downstream: no rocprofv3 →
   Profiler runs torch-trace only; aiter absent → drop aiter from candidate backends; gfx unknown →
   widen tuning search instead of trusting gfx942 priors.
+- **A *known* gfx from a different family is not the same as a *known-good* one.** Almost every
+  prior, playbook and learned card in this workflow was written on CDNA3/CDNA4 (gfx942/gfx950). When
+  the box is neither — e.g. `gfx1151`, an RDNA3.5 Strix Halo APU — the arch is not "unknown", so the
+  unknown-gfx rule above will not fire, and the CDNA priors get applied silently. Treat a non-`gfx9*`
+  arch as **CDNA priors invalid**: widen the tuning search exactly as for an unknown gfx, and see
+  §3a below for what actually transfers.
 
 ## What's a `block` vs a `degrade`
 | Condition | Verdict | Why |
@@ -30,6 +36,7 @@
 | port busy | **degrade** | dispatcher auto-allocates a free port; just record it |
 | rocprofv3 absent | **degrade** | Profiler falls back to torch-trace (shapes kept, HW durations approximate) |
 | `amd-smi`/`rocminfo` absent | **degrade** | record gfx as "unknown"; widen tuning, don't trust gfx942 priors |
+| gfx detected but not CDNA (`gfx9*`) — e.g. `gfx1151` | **degrade** | arch is known, CDNA priors are not: widen tuning, PROBE the aiter/CK/hipBLASLt rungs rather than assuming them absent, record `native_fp8` (§3a) |
 | aiter / CK profiler / hipblaslt-bench absent | **degrade** | remove those rungs from the backend ladder; note it |
 | baseline bench spread > ~5% **with more than one timed sample** | **degrade→re-measure** | noisy box; re-run, raise the noise band, or pin clocks. At the default single timed round `spread=0.0%` always — no evidence, so nothing to gate on |
 
@@ -60,6 +67,45 @@ is the capability signal the Architect uses instead of guessing from kernel name
 amd-smi list 2>/dev/null || rocm-smi --showid 2>/dev/null || rocminfo 2>/dev/null | grep -m1 gfx
 ```
 Record gfx (e.g. `gfx942`). Unknown → `degrade` (don't apply gfx942-specific priors blindly).
+
+**3a. Arch family, and what transfers.** The `gfx` string alone is not the capability — classify it:
+
+| Family | gfx | What this workflow's priors are worth |
+|---|---|---|
+| CDNA3 | `gfx942` | Everything. Most learned cards and playbook entries were measured here. |
+| CDNA4 | `gfx950` | Everything. |
+| RDNA3.5 | `gfx1151` (Radeon 8060S / Strix Halo APU) | **Little.** See below. |
+| anything else | — | Treat as unknown: widen the search, rank on `pct_gpu_time`. |
+
+On `gfx1151` specifically, these are the differences that invalidate a CDNA prior rather than merely
+shading it — each one is an integer factor, not a few percent:
+
+- **wave32, not wave64.** Every lane-width constant, ballot mask and occupancy divisor changes. The
+  CDNA occupancy ladder (4 SIMD/CU, 8 waves/SIMD, 512 VGPR combined with AGPRs) does not apply;
+  RDNA3.5 is 1536 VGPR/SIMD, granule 24, up to 16 waves/SIMD, and has **no AGPR file**. Applying the
+  CDNA ladder under-reports occupancy by 2–3×.
+- **WMMA, not MFMA.** `matrix_instr_nonkdim` and `kpack` are CDNA-only Triton knobs. MFMA shape
+  advice, MFMA hardware counters, and `MfmaUtil`-style metrics do not exist here.
+- **No fp8 matrix path at all** (WMMA does bf16/fp16/iu8/iu4; fp8 WMMA starts at RDNA4). torch still
+  hands out `float8_e4m3fn` as a storage dtype, so an fp8 regime will *run* — on an emulated path, at
+  a fraction of the bf16 rate. Record `native_fp8: false` and **drop fp8 regimes rather than
+  benchmark emulation**. Use `harness_lib.has_native_fp8(gfx)`; do not infer it from `fp8_is_fnuz`,
+  which answers *which format*, not *whether one exists*.
+- **Backend availability is a PROBE, not an arch inference.** aiter, CK and hipBLASLt all have
+  gfx11 targets, so do not drop them from the ladder because the box is RDNA — use the probes in
+  step 5 as for any other arch. In particular **hipBLASLt is tuned for gfx11**: a ROCm 7.2.3 install
+  carries 47 `TensileLibrary_*_gfx1151.dat` solution libraries spanning bf16/fp16/fp32/fp64/int8 and
+  all four transpose layouts, so it is a first-class GEMM backend there. Coverage is thinner than on
+  CDNA (the same install has 555 for gfx942), which makes per-shape solution selection a lever worth
+  pulling — not a reason to skip the rung. Count what the install actually carries:
+  `ls $ROCM_PATH/lib/hipblaslt/library | grep -c "gfx<arch>\.dat"`.
+- **LPDDR, not HBM, and shared with the CPU.** ~256 GB/s pin against 5.3–8 TB/s on CDNA — roughly
+  20–30× less bandwidth per FLOP, so ops that are compute-bound on MI300X are usually memory-bound
+  here. There is also a 32 MiB Infinity Cache tier between L2 and DRAM that CDNA has no equivalent
+  of. Single die: **no XCD**, so multi-XCD profiling caveats do not apply.
+
+Record the family and `native_fp8` in `env_report.json` so the Architect and Op Benchmarker gate on
+them instead of re-deriving from the gfx string.
 
 **4. Profiler capability (degrade-friendly).** Prefer rocprofv3 for authoritative HW durations, but
 never hard-require it:
@@ -129,6 +175,11 @@ Write `EVAL_DIR/env_report.md` (human) and `EVAL_DIR/env_report.json` (machine),
   "backend": "sglang", "backend_version": "0.5.11",
   "model": "/path", "model_arch_class": "hybrid_mamba_moe", "model_dtype": "bf16",
   "gfx": "gfx942", "gpu_ids": ["0"],
+  "arch_family": "CDNA3",                 // CDNA3|CDNA4|RDNA3.5|unknown -- see probe 3a. NOT derivable
+                                          // from `gfx` by any downstream reader that only knows gfx94x/gfx95x
+  "native_fp8": true,                     // harness_lib.has_native_fp8(gfx). false (e.g. gfx1151) => DROP fp8
+                                          // regimes; torch will otherwise run them on an emulated path
+                                          // and the number reported would be of emulation, not fp8
   "trace_sources": ["torch"],            // add "rocprofv3" if present
   "available_backends": ["aiter","hipblaslt","triton","flydsl"], // include "flydsl" iff aiter.ops.flydsl.is_flydsl_available(); aiter/ck/flydsl removed only if absent
   "absent_backends": {                    // one entry per OPTIONAL backend NOT available, with an actionable remedy (see probe 5)

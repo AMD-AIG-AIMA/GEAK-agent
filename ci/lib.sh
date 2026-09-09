@@ -236,7 +236,13 @@ detect_gpu_arch() {
   case "$gfx" in
     gfx950)          echo MI355 ;;
     gfx942|gfx90a)   echo MI300 ;;
-    *)               echo "$GEAK_GPU_ARCH_DEFAULT" ;;   # config.sh default (this cluster = gfx950)
+    "")              echo "$GEAK_GPU_ARCH_DEFAULT" ;;   # rocminfo unreadable: config.sh default
+    *)
+      echo "WARN: detected $gfx, which has no image bucket (only CDNA MI300/MI355 are mapped);" \
+           "falling back to $GEAK_GPU_ARCH_DEFAULT. That image is NOT built for $gfx --" \
+           "set GEAK_GPU_ARCH or IMAGE explicitly." >&2
+      echo "$GEAK_GPU_ARCH_DEFAULT"
+      ;;
   esac
 }
 

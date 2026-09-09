@@ -99,7 +99,13 @@ The most important section. Shows overall utilization as percentage of peak.
 | MFMA Utilization | Matrix unit usage | > 40% = MFMA-active workload |
 | VMEM Utilization | Vector memory pipe | > 60% = memory-bound |
 | LDS Utilization | Local data share | > 50% = LDS-heavy |
-| Bandwidth (GB/s) | Effective HBM BW | Compare to this card's HBM peak (≈5300 GB/s MI300X/300A, ~6000 MI325X, ~8000 MI350/355 — see `amd_instinct.md`) |
+| Bandwidth (GB/s) | Effective HBM BW | Compare to this card's HBM peak (≈5300 GB/s MI300X/300A, ~6000 MI325X, ~8000 MI350/355; **≈256 GB/s on gfx1151** — see `amd_instinct.md`) |
+
+> **On RDNA (`gfx11*`, e.g. gfx1151) read this table with two substitutions.** There is no MFMA unit:
+> the matrix row means **WMMA**, and the CDNA `Mfma*` counters do not exist, so a profiler that
+> reports nothing for them is telling you the counter is absent, not that the matrix unit is idle.
+> There is also no XCD (single die), so the multi-XCD caveat below does not apply. The VALU/VMEM/LDS
+> thresholds themselves still hold.
 
 **Classification from SoL:**
 - VALU > 60% AND VMEM < 40% → **compute-bound**
@@ -224,13 +230,16 @@ The report does not surface these, but each is a few counters already collected,
 real mislabel. Run them before forming a hypothesis.
 
 **Validate the peaks first (a wrong denominator invents or hides a bottleneck).**
-- **BF16 compute peak reads ~2× low.** BF16 and FP16 MFMA run at the same rate on these parts, so the
+- **BF16 compute peak reads ~2× low.** BF16 and FP16 run at the same rate on the matrix core of every
+  supported part (MFMA on CDNA, WMMA on RDNA), so the
   two reported peaks must be equal — the empirical BF16 peak often is not, which makes BF16 compute
   efficiency read ~2× high (we saw 185%, 396%). Any roofline efficiency **> 100%** is a mis-calibrated
   peak (or SFU ops folded into the perf counter on rmsnorm/rope), not a record. Prefer HBM% and F32
   MFMA%; pass `--roofline-data-type` if the tool supports it.
 - **HBM can under-report on multi-XCD.** If SoL HBM% looks implausibly low, cross-check with
-  `TCC_EA*_RDREQ_DRAM × 64B`, or bytes/time by hand.
+  `TCC_EA*_RDREQ_DRAM × 64B`, or bytes/time by hand. (Does not apply on `gfx11*` — single die. There,
+  a low HBM% more often means the working set is being served by the 32 MiB Infinity Cache, which
+  sits between L2 and DRAM and has no CDNA equivalent.)
 - **MoE padding inflates AI.** Recompute arithmetic intensity from *effective* FLOPs (not padded rows)
   and confirmed bytes before believing an "AI far right of ridge → compute-bound" call.
 

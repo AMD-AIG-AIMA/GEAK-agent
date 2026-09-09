@@ -113,11 +113,17 @@ Honor every axis **generically** via the shared `harness_lib` primitives — do 
 - **Compile** (`regime.compile`): if `torch_compile`, baseline against the COMPILED/fused path, not
   unfused eager (else the speedup is a strawman). Enforce it via `h.compiled_op(fn, regime)` on BOTH the
   baseline and candidate before timing (no-op when the regime is eager) — see the timing rule in step 4.
-- **fp8 format is arch-specific** (the ONE hardware axis): MI300/MI325 (gfx942/CDNA3) use AMD `fnuz`
-  fp8; MI355 (gfx950/CDNA4) use OCP `fn` fp8. `h.regime_dtype("fp8")` picks the running GPU's variant
-  automatically (or pass `arch=` for offline cross-arch synth); an explicit `fp8_e4m3fnuz`/`fp8_e4m3fn`
-  from the checkpoint config wins. The layout (`h.pack_x`) is arch-independent — every fp8 is 1 byte →
-  `x=16` on both. So do NOT hardcode `float8_e4m3fnuz`.
+- **fp8 format is arch-specific** (the one hardware axis *within CDNA*): MI300/MI325 (gfx942/CDNA3)
+  use AMD `fnuz` fp8; MI355 (gfx950/CDNA4) use OCP `fn` fp8. `h.regime_dtype("fp8")` picks the running
+  GPU's variant automatically (or pass `arch=` for offline cross-arch synth); an explicit
+  `fp8_e4m3fnuz`/`fp8_e4m3fn` from the checkpoint config wins. The layout (`h.pack_x`) is
+  arch-independent — every fp8 is 1 byte → `x=16` on both. So do NOT hardcode `float8_e4m3fnuz`.
+  - **Off CDNA it is not the only axis, and it is not even the right question.** On RDNA (e.g.
+    `gfx1151` / Strix Halo) the wave width, the matrix ISA (WMMA vs MFMA), the register file and the
+    LDS topology all differ too — and there is **no fp8 matrix path at all**. `fp8_is_fnuz` answers
+    *which format*, so it returns a confident `False` (= OCP) for a part that has no fp8 unit
+    whatsoever. Check `h.has_native_fp8(arch)` before extracting an fp8 kernel; if it is `False`,
+    the fp8 regime is emulated and reproducing it offline measures the emulation, not the kernel.
 If the live regime genuinely cannot be reproduced offline (op only exists fused in the compile graph,
 routing-dependent MoE token counts), say so in `notes` and report `editable:false`/drop rather than
 freeze an out-of-regime oracle nobody should trust.
