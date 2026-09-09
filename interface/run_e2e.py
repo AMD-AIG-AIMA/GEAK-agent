@@ -86,21 +86,73 @@ WORKFLOW_SETTINGS = os.environ.get(
 CLAUDE_BIN = os.environ.get("GEAK_CLAUDE_BIN", "").strip()
 
 # --- Swappable agent backend (standalone runtime) --------------------------
-# When GEAK_AGENT_BACKEND is set (e.g. "qwen" or "claude"), the JS workflow is
-# NOT run through Claude Code's Workflow tool. Instead it runs on the standalone
-# Node runtime (interface/runtime/run_workflow.mjs), which re-implements the
-# Workflow globals (agent/parallel/pipeline/phase/workflow) itself and dispatches
-# each agent() call to the named backend's one-shot CLI (qwen -p / claude -p).
-# This is what lets GEAK use qcoder (qwen-code), whose own CLI cannot orchestrate
-# parallel/nested subagents — the runtime does all of that. Unset (default) keeps
-# the original Claude/Workflow path below, byte-for-byte unchanged.
+# When a backend is selected — explicitly via GEAK_AGENT_BACKEND (e.g. "codex")
+# or derived from a configured provider key (see _derive_agent_from_env below) —
+# the JS workflow is NOT run through Claude Code's Workflow tool. Instead it runs
+# on the standalone Node runtime (interface/runtime/run_workflow.mjs), which
+# re-implements the Workflow globals (agent/parallel/pipeline/phase/workflow)
+# itself and dispatches each agent() call to the named backend's one-shot CLI
+# (codex exec / claude -p). This is what lets GEAK use a CLI that cannot itself
+# orchestrate parallel/nested subagents — the runtime does all of that.
+# With no backend selected AND no provider key configured, the original
+# Claude/Workflow path below runs byte-for-byte unchanged.
 AGENT_BACKEND = os.environ.get("GEAK_AGENT_BACKEND", "").strip()   # == --agent (back-compat alias)
 AGENT_PROFILE = os.environ.get("GEAK_AGENT_PROFILE", "").strip()   # a registry profile = (agent, model)
 AGENT_MODEL = os.environ.get("GEAK_MODEL", "").strip()             # override the model axis
 RUNTIME_SCRIPT = INTERFACE_DIR / "runtime" / "run_workflow.mjs"
+RUNTIME_REGISTRY = INTERFACE_DIR / "runtime" / "registry.json"
 NODE_BIN = os.environ.get("GEAK_NODE_BIN", "node")
-# Take the standalone-runtime path when EITHER an agent or a profile is selected.
-USE_RUNTIME = bool(AGENT_BACKEND or AGENT_PROFILE)
+
+
+# Credential-derived backend, mirroring deriveAgentFromEnv() in runtime/config.mjs:
+# configuring a provider key is by itself enough to select the CLI that key
+# belongs to, so a key-only setup does not additionally have to set
+# GEAK_AGENT_BACKEND. Both the trigger names and the per-agent credential sides
+# are read from registry.json — the same data the JS side uses — so the two can
+# never disagree about which keys mean what. A key selects its own agent only
+# when no OTHER agent's side is configured (hyperloom's is_openai_only() shape
+# test); an ambiguous environment keeps the native Claude path rather than
+# hijacking it. GEAK_AGENT_AUTO=0 opts out.
+def _side_env_names(agent: dict) -> list[str]:
+    triggers = [(p or {}).get("trigger_env") for p in agent.get("provider_autoselect") or []]
+    return [*(agent.get("credential_env") or []), *[t for t in triggers if t]]
+
+
+def _derive_agent_from_env() -> str:
+    if os.environ.get("GEAK_AGENT_AUTO", "1").strip().lower() in {"0", "false", "no"}:
+        return ""
+    if AGENT_BACKEND or AGENT_PROFILE:      # explicit selection always wins
+        return ""
+    try:
+        reg = json.loads(RUNTIME_REGISTRY.read_text())
+    except Exception:
+        return ""                            # no registry -> native Claude path
+    agents = (reg.get("agents") or {}).items()
+    configured = {
+        name for name, agent in agents
+        if any(os.environ.get(v, "").strip() for v in _side_env_names(agent))
+    }
+    triggered = next(
+        (
+            name for name, agent in agents
+            for prov in agent.get("provider_autoselect") or []
+            if (prov or {}).get("trigger_env")
+            and os.environ.get(prov["trigger_env"], "").strip()
+        ),
+        "",
+    )
+    if not triggered:
+        return ""
+    return triggered if configured <= {triggered} else ""
+
+
+AUTO_BACKEND = _derive_agent_from_env()
+# The backend actually used, however it was chosen. Passed to run_workflow.mjs as
+# an explicit --agent so the JS layer never re-derives and lands somewhere else.
+EFFECTIVE_BACKEND = AGENT_BACKEND or AUTO_BACKEND
+# Take the standalone-runtime path when an agent (explicit or derived) or a
+# profile is selected.
+USE_RUNTIME = bool(EFFECTIVE_BACKEND or AGENT_PROFILE)
 
 # Background-task completion race (see _invoke_via_sdk completion gate):
 # when the SDK turn "looks done" (a background task notified terminal + the
@@ -843,14 +895,15 @@ def _runtime_selection_args() -> list[str]:
     """The agent/model selection flags passed to run_workflow.mjs.
 
     Precedence mirrors the runtime: a profile (agent+model combo) OR an explicit
-    agent, plus an optional model override. run_workflow.mjs also reads the same
-    GEAK_* env, so this is belt-and-suspenders + makes the dry-run legible.
+    agent, plus an optional model override. A credential-derived agent is passed
+    explicitly too, so the runtime resolves the same backend this process decided
+    on instead of re-deriving it from its own view of the environment.
     """
     sel: list[str] = []
     if AGENT_PROFILE:
         sel += ["--profile", AGENT_PROFILE]
-    if AGENT_BACKEND:
-        sel += ["--agent", AGENT_BACKEND]
+    if EFFECTIVE_BACKEND:
+        sel += ["--agent", EFFECTIVE_BACKEND]
     if AGENT_MODEL:
         sel += ["--model", AGENT_MODEL]
     return sel
@@ -860,8 +913,9 @@ def runtime_combo_label() -> str:
     parts = []
     if AGENT_PROFILE:
         parts.append(f"profile={AGENT_PROFILE}")
-    if AGENT_BACKEND:
-        parts.append(f"agent={AGENT_BACKEND}")
+    if EFFECTIVE_BACKEND:
+        parts.append(f"agent={EFFECTIVE_BACKEND}"
+                     + (" (from key)" if AUTO_BACKEND and not AGENT_BACKEND else ""))
     if AGENT_MODEL:
         parts.append(f"model={AGENT_MODEL}")
     return " ".join(parts) or "native (claude/Workflow)"

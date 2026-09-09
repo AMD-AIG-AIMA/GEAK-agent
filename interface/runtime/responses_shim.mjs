@@ -11,7 +11,7 @@
 //
 // Fully env-parameterized (no hardcoded paths) so it is portable across machines:
 //   SHIM_PORT       listen port (default 8791)
-//   GW_BASE         upstream gateway base_url (default SaFE global)
+//   GW_BASE         upstream gateway base_url — REQUIRED, no default
 //   OPENAI_API_KEY  gateway key (falls back to ANTHROPIC_API_KEY)
 //   SSL_CERT_FILE   CA bundle for gateway TLS (optional)
 //   SHIM_DEBUG      when set, dump last req/upstream JSON for debugging
@@ -23,7 +23,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const PORT = parseInt(process.env.SHIM_PORT || '8791', 10);
-const GW_BASE = (process.env.GW_BASE || 'https://global.primus-safe.amd.com/api/v1/llm-proxy/v1').replace(/\/$/, '');
+// No default upstream: the SaFE gateway this used to point at is decommissioned,
+// and guessing a replacement would send the key somewhere the caller never named.
+const GW_BASE = String(process.env.GW_BASE || '').trim().replace(/\/$/, '');
+if (!GW_BASE) {
+  process.stderr.write('[shim] GW_BASE is required (upstream gateway base_url, e.g. https://gw.example.com/api/v1)\n');
+  process.exit(2);
+}
 const KEY = process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
 const ca = process.env.SSL_CERT_FILE ? fs.readFileSync(process.env.SSL_CERT_FILE) : undefined;
 const DEBUG_DIR = process.env.SHIM_DEBUG_DIR || process.cwd();

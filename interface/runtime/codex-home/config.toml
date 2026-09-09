@@ -1,7 +1,9 @@
 # Portable CODEX_HOME for the GEAK standalone runtime.
-# setup.sh sets CODEX_HOME to this directory. codex then talks to the local
-# responses-shim, which de-streams + normalizes + strips the namespace tool so
-# claude works via the SaFE gateway; gpt models can also go direct (safe_direct).
+# setup.sh sets CODEX_HOME to this directory. Only a FALLBACK: with the default
+# GEAK_CODEX_AUTOCONFIG=1 the runtime writes the provider via -c overrides and
+# never reads the providers below. codex talks to the local responses-shim, which
+# de-streams + normalizes + strips the namespace tool for gateways that need it;
+# api.openai.com needs none of that and is reached directly (provider `openai`).
 #
 # The shim must be running (setup.sh starts responses_shim.mjs on :8791).
 # The API key is read from OPENAI_API_KEY at runtime (never stored here).
@@ -9,23 +11,16 @@
 
 model_provider = "safe_shim"
 preferred_auth_method = "apikey"
-# Default thinking level. The runtime also injects `-c model_reasoning_effort=max`
-# for the codex agent (override via GEAK_CODEX_EFFORT / GEAK_CODEX_EXTRA_ARGS);
-# this line is the fallback when GEAK_CODEX_AUTOCONFIG=0.
-model_reasoning_effort = "max"
+# Default thinking level. codex's own scale is none|low|medium|high|xhigh — it has
+# no "max", so xhigh IS the maximum here. The runtime injects the same value via
+# `-c model_reasoning_effort=xhigh` (override with GEAK_CODEX_EFFORT, which also
+# accepts max as an alias); this line is the fallback when GEAK_CODEX_AUTOCONFIG=0.
+model_reasoning_effort = "xhigh"
 
 # claude (and anything the gateway serves) via the local de-streaming shim.
 [model_providers.safe_shim]
 name = "SaFE via responses-shim"
 base_url = "http://127.0.0.1:8791/v1"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
-
-# gpt-* can hit the gateway's /v1/responses directly (no shim needed).
-# Select it per-run with:  GEAK_CODEX_EXTRA_ARGS="-c model_provider=safe_direct"
-[model_providers.safe_direct]
-name = "SaFE gateway direct (gpt only)"
-base_url = "https://global.primus-safe.amd.com/api/v1/llm-proxy/v1"
 env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 

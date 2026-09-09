@@ -11,7 +11,8 @@
 #   OPENAI_API_KEY   gateway key (falls back to ANTHROPIC_API_KEY)
 #   SSL_CERT_FILE    CA bundle for gateway TLS (if your gateway needs one)
 # OPTIONAL:
-#   GEAK_GW_BASE     gateway base_url (default: SaFE global)
+#   GEAK_GW_BASE     upstream base_url for the shim. No default (the old SaFE
+#                    gateway is decommissioned); unset means the shim is not started.
 #   SHIM_PORT        shim listen port (default: 8791)
 #
 # Requires `node` on PATH. No npm install needed (runtime + shim use only builtins).
@@ -31,7 +32,7 @@ GEAK_RT_DIR=$(_geak_here)
 export OPENAI_API_KEY="${OPENAI_API_KEY:-$ANTHROPIC_API_KEY}"
 export NODE_EXTRA_CA_CERTS="${NODE_EXTRA_CA_CERTS:-$SSL_CERT_FILE}"
 export CODEX_HOME="$GEAK_RT_DIR/codex-home"
-GEAK_GW_BASE="${GEAK_GW_BASE:-https://global.primus-safe.amd.com/api/v1/llm-proxy/v1}"
+GEAK_GW_BASE="${GEAK_GW_BASE:-}"
 SHIM_PORT="${SHIM_PORT:-8791}"
 
 # qwen non-interactive auth selection (idempotent; harmless if qwen unused)
@@ -43,25 +44,27 @@ export QWEN_CODE_SUPPRESS_YOLO_WARNING=1
 if ! command -v node >/dev/null 2>&1; then
   echo "[setup] WARNING: 'node' not on PATH — install Node.js before running the runtime." >&2
 fi
-if [ -z "$OPENAI_API_KEY" ]; then
-  echo "[setup] WARNING: OPENAI_API_KEY (or ANTHROPIC_API_KEY) is empty — codex/qwen will 401." >&2
+if [ -z "$OPENAI_API_KEY" ] && [ -z "$AMDKEY" ]; then
+  echo "[setup] WARNING: no provider key set (AMDKEY / OPENAI_API_KEY / ANTHROPIC_API_KEY) — codex/qwen will 401." >&2
 fi
 
-# Start the codex responses-shim if not already up (needed for codex + claude).
-if command -v node >/dev/null 2>&1; then
+# Start the de-streaming shim only when an upstream was named. The common paths
+# (AMD gateway, official OpenAI) serve /v1/responses directly and need no shim.
+if [ -z "$GEAK_GW_BASE" ]; then
+  echo "[setup] GEAK_GW_BASE unset — shim not started (not needed for direct /v1/responses endpoints)"
+elif command -v node >/dev/null 2>&1; then
   if pgrep -f "$GEAK_RT_DIR/responses_shim.mjs" >/dev/null 2>&1; then
     echo "[setup] shim already running on :$SHIM_PORT"
   else
     GW_BASE="$GEAK_GW_BASE" SHIM_PORT="$SHIM_PORT" OPENAI_API_KEY="$OPENAI_API_KEY" SSL_CERT_FILE="$SSL_CERT_FILE" \
       node "$GEAK_RT_DIR/responses_shim.mjs" > "$GEAK_RT_DIR/shim.log" 2>&1 &
     sleep 3
-    echo "[setup] started shim on :$SHIM_PORT (log: $GEAK_RT_DIR/shim.log)"
+    echo "[setup] started shim on :$SHIM_PORT -> $GEAK_GW_BASE (log: $GEAK_RT_DIR/shim.log)"
   fi
 fi
 
 echo "[setup] CODEX_HOME=$CODEX_HOME"
-echo "[setup] gateway=$GEAK_GW_BASE"
-echo "[setup] run: node $GEAK_RT_DIR/run_workflow.mjs <workflow.js> --profile codex-opus48"
+echo "[setup] run: node $GEAK_RT_DIR/run_workflow.mjs <workflow.js> --agent codex"
 
 # cursor is unrelated to the shim/gateway (it uses Cursor's private cloud).
 if command -v cursor-agent >/dev/null 2>&1; then

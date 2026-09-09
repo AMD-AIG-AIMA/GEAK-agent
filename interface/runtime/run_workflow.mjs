@@ -255,6 +255,9 @@ export async function selectBackend(opts = {}) {
     profile: flag('profile') || process.env.GEAK_AGENT_PROFILE,
     agent: flag('agent') || process.env.GEAK_AGENT_BACKEND,
     model: flag('model') || process.env.GEAK_MODEL,
+    // Lets a provider key select its own CLI when nothing was named explicitly,
+    // so a single-kernel run needs no more setup than an e2e run does.
+    env: process.env,
   };
   const registryPath = flag('registry') || process.env.GEAK_REGISTRY;
   const registry = await loadRegistry(registryPath || undefined);
