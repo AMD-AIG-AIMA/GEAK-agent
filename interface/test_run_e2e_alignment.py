@@ -17,13 +17,14 @@ alignment_metrics):
     same-config metric.
   * ``raw_session_baseline_divergence_pct`` = GEAK baseline vs the orchestrator
     RAW baseline (conflates config gain + residue) — audit only.
-  * ``cold_speedup`` = GEAK cold final / orchestrator COLD baseline — the exact
-    number Hyperloom promotes as its (cross-harness) PROVISIONAL gain, so it must
-    equal current_best.tput / baseline_tput.
+  * ``cold_speedup`` = GEAK cold final / the orchestrator anchor Hyperloom
+    promotes, so it must equal current_best.tput / baseline_tput. Note the
+    anchor is normally a HOT measure round (Hyperloom discards its warmup
+    round); ``orchestrator_baseline_lifecycle`` says which, and
+    ``hot_speedup`` is the hot-to-hot pairing.
 
 Run: python3 -m pytest GEAK/interface/test_run_e2e_alignment.py -v
 """
-
 from __future__ import annotations
 
 import importlib.util
@@ -46,12 +47,6 @@ rx = _load()
 
 
 def _wf(eval_dir: Path, *, base: float, final: float, speedup: float) -> dict:
-    baseline_path = eval_dir / "baseline" / "bench_summary.json"
-    if not baseline_path.exists():
-        baseline_path.parent.mkdir(parents=True, exist_ok=True)
-        baseline_path.write_text(
-            json.dumps({"throughput_tok_s_median": base}), encoding="utf-8"
-        )
     return {
         "eval_dir": str(eval_dir),
         "baseline_throughput_tok_s": base,
@@ -80,7 +75,9 @@ def test_issue6_names_raw_and_same_config_divergence_explicitly(
     out = rx.normalize_result(h, wf)
     bb = out["baseline_basis"]
 
-    assert bb["raw_session_baseline_divergence_pct"] == pytest.approx(7.73, abs=0.01)
+    assert bb["raw_session_baseline_divergence_pct"] == pytest.approx(
+        7.73, abs=0.01
+    )
     assert bb["current_best_same_config_divergence_pct"] == pytest.approx(
         0.04, abs=0.01
     )
@@ -91,10 +88,6 @@ def test_issue6_names_raw_and_same_config_divergence_explicitly(
     assert "baseline_divergence_pct" not in bb
     assert bb["orchestrator_best_tput_same_config"] == pytest.approx(orch_same_cfg)
     assert out["baseline_alignment"]["status"] == "aligned"
-    # An older handoff may have a numeric same-config reference but no observed
-    # server identity. Do not upgrade that number into a verified launch match.
-    assert out["handoff_alignment"]["status"] == "unverified"
-    assert out["server_identity"]["status"] == "unavailable"
 
 
 def test_same_config_divergence_above_threshold_is_warning(
@@ -139,7 +132,9 @@ def test_large_raw_gain_does_not_trigger_alignment_warning(tmp_path: Path) -> No
     out = rx.normalize_result(h, wf)
     bb = out["baseline_basis"]
 
-    assert bb["raw_session_baseline_divergence_pct"] == pytest.approx(20.2, abs=0.01)
+    assert bb["raw_session_baseline_divergence_pct"] == pytest.approx(
+        20.2, abs=0.01
+    )
     assert bb["current_best_same_config_divergence_pct"] == pytest.approx(
         0.17, abs=0.01
     )
@@ -163,7 +158,6 @@ def test_same_config_alignment_unavailable_without_reference(tmp_path: Path) -> 
     assert bb["current_best_same_config_divergence_pct"] is None
     assert bb["raw_session_baseline_divergence_pct"] is not None
     assert out["baseline_alignment"]["status"] == "unavailable"
-    assert out["handoff_alignment"]["status"] == "unavailable"
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
@@ -380,7 +374,8 @@ def test_map_args_consumes_schema_v2_effective_config(tmp_path: Path) -> None:
         "baseline_env_spec": {
             "config": {
                 "server_launch_flags": (
-                    "--trust-remote-code --disable-radix-cache --context-length 11264"
+                    "--trust-remote-code --disable-radix-cache "
+                    "--context-length 11264"
                 ),
                 "extra_server_args": "--context-length 11264",
                 "extra_envs": {"SGLANG_USE_AITER": "1"},
@@ -404,7 +399,14 @@ def test_map_args_consumes_schema_v2_effective_config(tmp_path: Path) -> None:
     assert "SGLANG_USE_AITER=1" in ps["initial_extra_env"]
     assert ps["initial_overlay_pythonpath"] == f"{overlay}:{snapshot}"
     assert len(ps["effective_config_digest"]) == 64
-    assert ps["measurement_mode"] == "isolated_server"
+    # ONE lifecycle for the whole run, and it is Hyperloom's: 1 boot per leg, a discarded
+    # full warmup round, then the timed round -- exactly two client passes with the second
+    # one reported, which is what warmup_round/measure_round does.  The round count is not
+    # a separate knob; it is what warm_server means.
+    assert ps["measurement_mode"] == "warm_server"
+    assert ps["validation_measurement_mode"] == "warm_server"
+    assert "validation_rounds" not in ps
+    # Only consulted if a caller pins validation back to isolated_server.
     assert ps["validation_replicas"] == 3
 
 
@@ -487,9 +489,7 @@ def test_fold_noop_when_knobs_absent(tmp_path: Path) -> None:
         framework="vllm",
         accepted_flags="--max-num-batched-tokens 24576",
     )
-    assert (
-        rx.map_args(h)["initial_extra_server_args"] == "--max-num-batched-tokens 24576"
-    )
+    assert rx.map_args(h)["initial_extra_server_args"] == "--max-num-batched-tokens 24576"
 
 
 def test_fold_unknown_backend_left_untouched(tmp_path: Path) -> None:
@@ -513,12 +513,9 @@ def test_fold_helper_dedup_and_forms() -> None:
     assert out.count("--max-model-len") == 1
     assert "2248" not in out
     # Unknown backend returns input verbatim.
-    assert (
-        rx._fold_serving_fidelity_flags(
-            "--x 1", backend="mystack", max_model_len=10, mem_fraction=0.5
-        )
-        == "--x 1"
-    )
+    assert rx._fold_serving_fidelity_flags(
+        "--x 1", backend="mystack", max_model_len=10, mem_fraction=0.5
+    ) == "--x 1"
     # Empty seed + both knobs => clean space-joined string, no leading space.
     out2 = rx._fold_serving_fidelity_flags(
         "", backend="sglang", max_model_len=4096, mem_fraction=0.9
@@ -549,25 +546,18 @@ def test_promoted_final_is_hot_and_cold_stays_a_diagnostic(tmp_path: Path) -> No
     (eval_dir / "baseline").mkdir(parents=True)
     (eval_dir / "validation" / "final").mkdir(parents=True)
     (eval_dir / "baseline" / "bench_summary.json").write_text(
-        json.dumps(
-            {
-                "output_throughput_tok_s_median": 450.0,
-                "cold_output_throughput_tok_s": 460.0,
-            }
-        ),
+        json.dumps({"output_throughput_tok_s_median": 450.0,
+                    "cold_output_throughput_tok_s": 460.0}),
         encoding="utf-8",
     )
     (eval_dir / "validation" / "final" / "bench_summary.json").write_text(
-        json.dumps(
-            {
-                "output_throughput_tok_s_median": 500.0,
-                "cold_output_throughput_tok_s": 480.0,
-            }
-        ),
+        json.dumps({"output_throughput_tok_s_median": 500.0,
+                    "cold_output_throughput_tok_s": 480.0}),
         encoding="utf-8",
     )
     # raw_baseline_tput is the orchestrator's COLD leaderboard anchor.
-    h = {"workload": {"isl": 1024, "osl": 1024, "conc": 64}, "raw_baseline_tput": 440.0}
+    h = {"workload": {"isl": 1024, "osl": 1024, "conc": 64},
+         "raw_baseline_tput": 440.0}
     r = rx.normalize_result(h, _wf(eval_dir, base=450.0, final=500.0, speedup=1.1111))
     am = r["alignment_metrics"]
 
@@ -587,82 +577,157 @@ def test_promoted_final_is_hot_and_cold_stays_a_diagnostic(tmp_path: Path) -> No
     assert am["cold_speedup"] < hot_over_cold
 
 
-def test_server_identity_evidence_parsing_and_alignment(tmp_path: Path) -> None:
-    """Launch identity is accepted only when observable fields support it."""
-    complete = (
-        "prefix ServerArgs(model_path='/models/qwen', tp_size=2, "
-        "context_length=8192, dtype=unknown, ignored='value') suffix"
-    )
-    assert rx._balanced_server_args("no record") == ""
-    assert rx._balanced_server_args("ServerArgs(model_path='unterminated'") == ""
-    assert rx._balanced_server_args(complete).startswith("ServerArgs(")
-    assert rx._parse_sglang_server_args("no record") == {}
-    assert rx._parse_sglang_server_args("ServerArgs(") == {}
-    assert rx._parse_sglang_server_args("{'not': 'a call'}") == {}
-    assert rx._parse_sglang_server_args(complete) == {
-        "model_path": "/models/qwen",
-        "tp_size": 2,
-        "context_length": 8192,
-    }
+# --- Regression: an unverified upstream same-config reference -----------------
+#
+# Anchored on the real Hyperloom run MiniMax-M3-MXFP4/20260904T002558Z-3de91cb3,
+# which handed GEAK `orchestrator_best_tput_same_config: 0.0` with
+# `same_config_reference_status: "unverified"` and zero accepted kernels. The
+# session still reported hot_speedup ~1.19 -- entirely Hyperloom's OWN explore
+# gain, because hot_speedup's denominator is the RAW session baseline
+# (3693.71 tok/s hot measure round) and its numerator is the post-explore
+# accepted config (measured on-hardware at 4379.15 tok/s under warm_server).
 
-    log = tmp_path / "server.log"
-    log.write_text(
-        "startup\nServerArgs(model_path='/models/qwen', tp_size=2,\n"
-        "context_length=8192)\n",
+
+def _minimax_handoff(
+    *,
+    status: str | None = "unverified",
+    exp_root: Path | None = None,
+) -> dict:
+    h = {
+        "workload": {"isl": 8192, "osl": 1024, "conc": 64},
+        "raw_baseline_tput": 3693.7114118953027,
+        "orchestrator_best_tput_same_config": 0.0,
+    }
+    if status is not None:
+        h["same_config_reference_status"] = status
+    if exp_root is not None:
+        # Hyperloom's double-run baseline: a full warmup round it discarded,
+        # then the hot measure round that became state.baseline_tput. Without
+        # this verdict the hot-to-hot pairings correctly degrade to None.
+        (exp_root / "state.json").write_text(
+            json.dumps({
+                "baseline_tput": 3693.7114118953027,
+                "baseline_warm_runtime_sec": 53.23,
+                "baseline_measure_round_dropped": False,
+            }),
+            encoding="utf-8",
+        )
+        h["exp_root"] = str(exp_root)
+    return h
+
+
+def test_unverified_same_config_reference_is_named_as_upstream_gap(
+    tmp_path: Path,
+) -> None:
+    """A 0.0 reference the orchestrator called unverified is not GEAK's failure."""
+    eval_dir = tmp_path / "e2e"
+    eval_dir.mkdir()
+    wf = _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0)
+
+    out = rx.normalize_result(_minimax_handoff(), wf)
+    al = out["baseline_alignment"]
+
+    assert al["status"] == "unavailable_reference_unverified"
+    assert al["same_config_reference_status"] == "unverified"
+    # The reference really is absent -- the new status must not invent one.
+    assert out["baseline_basis"]["current_best_same_config_divergence_pct"] is None
+    json.dumps(out, allow_nan=False)
+
+
+def test_verified_and_missing_status_keep_the_plain_unavailable_status(
+    tmp_path: Path,
+) -> None:
+    """Only a non-"verified" upstream verdict earns the sharper status."""
+    cases = (
+        ("verified", "unavailable"),
+        ("VERIFIED", "unavailable"),
+        (None, "unavailable"),
+        ("", "unavailable"),
+        ("unverified", "unavailable_reference_unverified"),
+        ("stale", "unavailable_reference_unverified"),
+    )
+    for index, (status, expected) in enumerate(cases):
+        eval_dir = tmp_path / f"e2e_{index}"
+        eval_dir.mkdir()
+        out = rx.normalize_result(
+            _minimax_handoff(status=status),
+            _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0),
+        )
+        al = out["baseline_alignment"]
+        assert al["status"] == expected, (status, al["status"])
+        # Normalized to lowercase, None when the handoff said nothing at all.
+        assert al["same_config_reference_status"] == (
+            status.lower() if status else None
+        )
+
+
+def test_hot_speedup_declares_its_denominator_and_config_gain(
+    tmp_path: Path,
+) -> None:
+    """hot_speedup must self-label as raw-baseline-relative, not GEAK-only."""
+    eval_dir = tmp_path / "e2e"
+    eval_dir.mkdir()
+    (eval_dir / "baseline").mkdir()
+    (eval_dir / "validation" / "final").mkdir(parents=True)
+    # GEAK's own warm_server measurement of the seeded (already-accepted) config:
+    # the discarded cold outer round + the hot median, both real numbers.
+    (eval_dir / "baseline" / "bench_summary.json").write_text(
+        json.dumps({"output_throughput_tok_s_median": 4379.154,
+                    "cold_output_throughput_tok_s": 2580.58}),
         encoding="utf-8",
     )
-    observed, reason = rx._read_server_identity_evidence(log)
-    assert reason == ""
-    assert observed == {
-        "backend": "sglang",
-        "server_args": {
-            "model_path": "/models/qwen",
-            "tp_size": 2,
-            "context_length": 8192,
-        },
-    }
-
-    identity_log = tmp_path / "identity.log"
-    identity_log.write_text("observed_launch_identity: recipe:deadbeef\n", encoding="utf-8")
-    assert rx._read_server_identity_evidence(identity_log) == (
-        {"launch_identity": "recipe:deadbeef"},
-        "",
+    (eval_dir / "validation" / "final" / "bench_summary.json").write_text(
+        json.dumps({"output_throughput_tok_s_median": 4379.154,
+                    "cold_output_throughput_tok_s": 2580.58}),
+        encoding="utf-8",
     )
-    assert rx._read_server_identity_evidence(tmp_path / "missing.log") == ({}, "")
+    wf = _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0)
 
-    expected = {
-        "backend": "sglang",
-        "server_args": {"model_path": "/models/qwen", "tp_size": 2},
-    }
-    assert rx._handoff_observed_identity({"observed_server_identity": expected}) == (
-        expected,
-        "observed_server_identity",
-    )
-    assert rx._handoff_observed_identity(
-        {"baseline_env_spec": {"launch_identity": "recipe:deadbeef"}}
-    ) == ("recipe:deadbeef", "baseline_env_spec.launch_identity")
-    assert rx._handoff_observed_identity({}) == (None, "")
-    assert rx._identity_value_equal("recipe:deadbeef", {"launch_identity": "recipe:deadbeef"})
-    assert rx._identity_value_equal("recipe:deadbeef", {}) is None
-    assert rx._identity_value_equal(expected, observed)
-    assert not rx._identity_value_equal(
-        expected, {"backend": "sglang", "server_args": {"model_path": "/models/qwen", "tp_size": 4}}
-    )
-    assert rx._identity_value_equal(
-        expected, {"backend": "sglang", "server_args": {"model_path": "/models/qwen"}}
-    ) is None
-    assert rx._identity_value_equal({"backend": "vllm", "server_args": {}}, observed) is None
+    out = rx.normalize_result(_minimax_handoff(exp_root=tmp_path), wf)
+    am = out["alignment_metrics"]
 
+    # GEAK accepted nothing here, and hot_geak_speedup says so honestly...
+    assert am["hot_geak_speedup"] == pytest.approx(1.0, abs=1e-4)
+    # ...while hot_speedup is ~1.19 purely from Hyperloom's own config gain.
+    assert am["hot_speedup"] == pytest.approx(4379.154 / 3693.7114118953027,
+                                             abs=1e-3)
+    assert am["hot_speedup"] > 1.15
+    # Which is exactly why the block must say whose gain that is.
+    assert am["hot_speedup_denominator"] == "raw_session_baseline"
+    assert am["hot_speedup_includes_orchestrator_config_gain"] is True
+    # The only same-config pairing -- absent, because upstream never verified it.
+    assert am["hot_speedup_same_config"] is None
+    json.dumps(out, allow_nan=False)
+
+
+def test_unverified_reference_caveat_reaches_the_rendered_report(
+    tmp_path: Path,
+) -> None:
+    """The status is useless if only the JSON carries the explanation."""
     eval_dir = tmp_path / "e2e"
-    baseline = eval_dir / "baseline"
-    baseline.mkdir(parents=True)
-    (baseline / "server.log").write_text(complete, encoding="utf-8")
-    matched = rx._server_identity_alignment(
-        {"observed_server_identity": expected}, eval_dir
+    eval_dir.mkdir()
+    out = rx.normalize_result(
+        _minimax_handoff(),
+        _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0),
     )
-    assert matched["status"] == "matched"
-    assert matched["evidence_paths"] == [str(baseline / "server.log")]
-    assert rx._server_identity_alignment({}, eval_dir)["status"] == "unavailable"
-    assert rx._server_identity_alignment(
-        {"observed_server_identity": "recipe:deadbeef"}, eval_dir
-    )["status"] == "unverified"
+    section = rx._render_baseline_alignment_section(out)
+
+    assert "unavailable_reference_unverified" in section
+    assert "upstream handoff gap" in section
+    assert "hot_geak_speedup" in section
+    # Idempotent, like the rest of the section.
+    assert rx._render_baseline_alignment_section(out) == section
+
+
+def test_verified_reference_report_has_no_unverified_caveat(
+    tmp_path: Path,
+) -> None:
+    eval_dir = tmp_path / "e2e"
+    eval_dir.mkdir()
+    out = rx.normalize_result(
+        _minimax_handoff(status="verified"),
+        _wf(eval_dir, base=4379.154, final=4379.154, speedup=1.0),
+    )
+    section = rx._render_baseline_alignment_section(out)
+
+    assert "upstream handoff gap" not in section

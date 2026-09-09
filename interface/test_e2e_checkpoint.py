@@ -104,6 +104,19 @@ def test_recovers_tuning_checkpoint_and_preserves_kernel_metadata(tmp_path):
     assert kernel["e2e"]["e2e_gain_scope"] == "tuning_stack_unattributed"
 
 
+def test_recovers_warm_server_checkpoint(tmp_path):
+    eval_dir = tmp_path / "e2e"
+    checkpoint = _checkpoint(eval_dir, "final_pair")
+    checkpoint["measurement"]["measurement_mode"] = "warm_server"
+    checkpoint["checkpoint_sha256"] = rx._checkpoint_digest(checkpoint)
+    _write(eval_dir, "final/e2e_validation.json", checkpoint)
+
+    recovered = rx._recover_e2e_validation_checkpoint(eval_dir)
+
+    assert recovered["recovered_e2e_checkpoint_level"] == "final_pair"
+    assert recovered["throughput_speedup"] == 1.1
+
+
 def test_recovers_warm_start_config_checkpoint_as_config_sweep(tmp_path):
     eval_dir = tmp_path / "e2e"
     checkpoint = _checkpoint(eval_dir, "config_sweep")

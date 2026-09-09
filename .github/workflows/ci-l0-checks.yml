@@ -124,6 +124,8 @@ jobs:
             kernel_workflow/scripts/tests/test_kb_loop_offline.py \
             interface/test_effective_config.py \
             e2e_workflow/scripts/tests/test_bench_replica_lifecycle.py \
+            e2e_workflow/scripts/tests/test_bench_summarize.py \
+            e2e_workflow/scripts/tests/test_inferencex_client_warmup_parity.py \
             e2e_workflow/scripts/tests/test_roofline_skill.py \
             e2e_workflow/scripts/tests/test_vllm_adapter_profiler_config.py \
             geak/test_bootstrap.py
