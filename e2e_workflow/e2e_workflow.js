@@ -759,6 +759,7 @@ const TUNING_SCHEMA = obj({
   ran: { type: 'boolean' }, mode: { type: 'string' }, skills_used: arrStr,
   preflight: { type: 'object', additionalProperties: true },
   ops_tuned: arrObj, artifacts: arrStr,
+  runtime_csv_manifests: arrStr,
   // Deploy bundle: how a tuned DATA artifact reaches production. GEAK's overlay is a PYTHONPATH
   // mechanism for code, but tuned config tables are data a library reads from its own package dir, and
   // some need a derived cache dropped before they take effect. Neither travels in the overlay — so the
@@ -3176,6 +3177,7 @@ if (want('tune') && TUNING_SKILLSET_ENABLED) {
       PROFILE_TOPN: profile ? profile.profile_topN_json : '',
       TUNING_TARGETS: (strategy && strategy.head_candidates) || headQueue || [],
       TUNING_SKILLSET_DIR, TUNING_KB_ENABLED, SKILL_DIR: WORKFLOW_DIR,
+      RUNTIME_CSV_SCRIPT: WORKFLOW_DIR + '/scripts/runtime_csv.py',
       // The always-fires channel, same as the Architect's and the config_tuner's. The prompt BLOCK
       // above can be empty (no candidates, or the read never ran); these Inputs entries are how the
       // role learns the store exists at all. Gated by TUNING_KB_ENABLED for the same reason
@@ -3215,6 +3217,12 @@ if (want('tune') && TUNING_SKILLSET_ENABLED) {
   // failure mode is silent (the artifact lands where nothing reads it and the timing still moves). A
   // completed BOTH-leg A/B is required for the same reason it is on the head track — a post-only number
   // is not a measurement.
+  if (tuning && tuning.gate === 'accepted') {
+    const { execFileSync } = require('child_process');
+    execFileSync('python3', [WORKFLOW_DIR + '/scripts/runtime_csv.py', '--verify-tuning', '--eval-dir', EVAL_DIR],
+      { input: JSON.stringify(tuning), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 });
+    if ((tuning.runtime_csv_manifests || []).length) tuning.deploy_verified = true;
+  }
   const tuned = tuning && tuning.gate === 'accepted';
   const tuneOk = tuned && tuning.engagement_verified === true && tuning.ab_complete !== false &&
     tuning.correctness_gate !== 'fail' && tuning.post_tune_throughput_tok_s > 0 &&
@@ -3455,10 +3463,11 @@ const TUNING_REPORT_INPUTS = (TUNING_SKILLSET_ENABLED && tuning) ? { TUNING_RESU
 // leaves the Finalize prompt byte-identical.
 const TUNING_FINALIZE_INPUTS = (TUNING_SKILLSET_ENABLED && tuning && tuning.gate === 'accepted')
   ? {
-    TUNING_DEPLOY_BUNDLE: tuning.deploy_bundle || `${EVAL_DIR}/tuning/deploy`,
+    TUNING_DEPLOY_BUNDLE: tuning.deploy_bundle || ((tuning.runtime_csv_manifests || []).length ? '' : `${EVAL_DIR}/tuning/deploy`),
     TUNING_APPLY_ENV: tuning.apply_env || '',
     TUNING_CACHE_INVALIDATION: tuning.cache_invalidation || [],
     TUNING_ARTIFACTS: tuning.artifacts || [],
+    TUNING_RUNTIME_CSV_MANIFESTS: tuning.runtime_csv_manifests || [],
     TUNING_LIVE_TREE_FILES: tuning.live_tree_files || [],
     TUNING_OVERLAY: tuning.apply_overlay || '',
   }
@@ -4923,6 +4932,7 @@ function tuningReturn() {
       isolated_speedup: o.isolated_speedup || 0, engaged: o.engaged === true, artifact: o.artifact || '',
     })),
     artifacts: tuning.artifacts || [],
+    runtime_csv_manifests: tuning.runtime_csv_manifests || [],
     // How the win reaches production. Consumers that need to reproduce the tuning outside this run read
     // deploy_bundle (its deploy.sh is idempotent); final_launch.sh already invokes it.
     deploy_bundle: tuning.deploy_bundle || '', deploy_verified: tuning.deploy_verified === true,

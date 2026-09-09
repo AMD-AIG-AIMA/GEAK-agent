@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from e2e_workflow.scripts.runtime_csv import build_runtime_csv
+
 _HERE = Path(__file__).resolve().parent
 
 
@@ -880,6 +882,57 @@ def test_emit_on_success(monkeypatch, tmp_path):
     rendered = report.read_text(encoding="utf-8")
     assert rendered.count(rx.BASELINE_ALIGNMENT_BEGIN) == 1
     assert (eval_dir / "kernel_journey.json").is_file()
+
+
+@pytest.mark.parametrize("route", ["live", "cached", "interrupted"])
+@pytest.mark.parametrize("runtime_csv", [False, True])
+def test_tuning_delivery_is_verified_on_live_cached_and_interrupted_emission(
+    monkeypatch, tmp_path, route, runtime_csv
+):
+    eval_dir = _make_eval_dir(tmp_path)
+    tuning = {"enabled": True, "ran": True, "gate": "accepted",
+              "live_tree_files": ["aiter/configs/model_configs/tuned.csv"]}
+    if runtime_csv:
+        baseline = tmp_path / "stock.csv"
+        baseline.write_text("M,kernel\n64,stock\n128,retained\n")
+        tuned = tmp_path / "tuned.csv"
+        tuned.write_text("M,kernel\n64,candidate\n")
+        output = eval_dir / "final/tuning/runtime/gemm"
+        table = build_runtime_csv(baseline, [tuned], output, "AITER_CONFIG_GEMM_BF16", ["M"])
+        tuning.update(runtime_csv_manifests=[str(output / "runtime_csv.json")],
+                      apply_env=table["apply_env"], live_tree_files=[])
+    wf = {
+        "eval_dir": str(eval_dir), "throughput_speedup": 1.16,
+        "final_throughput_tok_s": 535.352, "baseline_throughput_tok_s": 461.314,
+        "tuning_skillset": tuning,
+        "accepted_config": {"flags": "", "env": tuning.get("apply_env", "")},
+    }
+    if route == "cached":
+        (eval_dir / "workflow_return.json").write_text(json.dumps(wf))
+
+    def invoke(*args):
+        assert route != "cached", "A completed run must recover without invoking a worker"
+        if route == "interrupted":
+            saved = eval_dir / "tuning/tuning_result.json"
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            saved.write_text(json.dumps(tuning))
+            candidate = eval_dir / "overlay/cand_fused_moe_kernel_gptq_awq/integrate_result.json"
+            integration = json.loads(candidate.read_text())
+            integration["apply_env"] = tuning.get("apply_env", "")
+            candidate.write_text(json.dumps(integration))
+            raise RuntimeError("CPU workflow interruption fixture")
+        return wf
+
+    _, result_path = _run_main(monkeypatch, tmp_path, eval_dir, invoke=invoke)
+    result = json.loads(result_path.read_text())
+    if runtime_csv:
+        assert result["status"] == "ok"
+        assert result["tuning_skillset"]["runtime_csvs"] == [table]
+        assert result["accepted_config"]["env_map"][table["env_name"]] == table["candidate"]["path"]
+    else:
+        assert result["status"] == "error"
+        assert "complete per-process runtime CSVs" in result["error"]
+        assert "throughput_speedup" not in result
 
 
 @pytest.mark.parametrize("config", [

@@ -52,6 +52,7 @@ except ModuleNotFoundError:  # Direct: python interface/run_e2e.py ...
     from effective_config import resolve_effective_config, resolve_unset_envs
 
 from e2e_workflow.scripts.adapters.extra_env import parse_unset_envs
+from e2e_workflow.scripts.runtime_csv import verify_runtime_tuning
 
 SCHEMA_VERSION = 2
 KERNEL_JOURNEY_SCHEMA_VERSION = 1
@@ -3248,6 +3249,10 @@ def normalize_result(h: dict, wf: dict) -> dict:
     # ADDITIVE ONLY. Appended after the dict above is complete so it is self-evident at review time that
     # no existing key is touched, and omitted entirely when the phase did not run.
     tuning_section = _tuning_skillset_section(wf, eval_dir)
+    if tuning_section is not None and tuning_section.get("gate") == "accepted" and tuning_section.get("runtime_csv_manifests"):
+        runtime_csvs = verify_runtime_tuning(tuning_section, eval_dir, accepted_config["env_map"])
+        if runtime_csvs:
+            tuning_section["runtime_csvs"] = runtime_csvs
     if tuning_section is not None:
         result["tuning_skillset"] = tuning_section
     return result
@@ -3272,6 +3277,10 @@ def _tuning_skillset_section(wf: dict, eval_dir: Path) -> dict | None:
     caller that reproduces the bundle by hand needs to know the deploy step exists.
     """
     t = wf.get("tuning_skillset")
+    if not isinstance(t, dict):
+        persisted = _read_json(eval_dir / TUNING_RESULT_FILE)
+        if persisted:
+            t = {"enabled": True, "ran": True, **persisted}
     if not isinstance(t, dict) or not t.get("enabled"):
         return None
     if not t.get("ran"):
@@ -3338,6 +3347,8 @@ def _tuning_skillset_section(wf: dict, eval_dir: Path) -> dict | None:
 
     if accepted:
         section["artifacts"] = t.get("artifacts") or []
+        if t.get("runtime_csv_manifests"):
+            section["runtime_csv_manifests"] = t["runtime_csv_manifests"]
         section["apply_env"] = t.get("apply_env") or ""
         section["apply_flags"] = t.get("apply_flags") or ""
         section["cache_invalidation"] = t.get("cache_invalidation") or []
@@ -3368,6 +3379,15 @@ def _tuning_skillset_section(wf: dict, eval_dir: Path) -> dict | None:
                 else str(eval_dir / "final" / "tuning" / "deploy.sh")
             ),
         }
+        if section.get("runtime_csv_manifests") and not section["live_tree_files"] and not section["cache_invalidation"]:
+            section["deploy_bundle"] = t.get("deploy_bundle") or ""
+            section["reaches_production_via"] = {
+                "note": "Complete immutable CSV tables travel through the accepted AITER_CONFIG environment. Each arm selects its own table; no installed-tree writes or shared cache invalidation are required.",
+                "runtime_csv_manifests": section["runtime_csv_manifests"],
+                "final_patch_includes_tuning": False,
+                "final_launch_runs_deploy": False,
+                "deploy_script": "",
+            }
     return section
 
 
@@ -6254,6 +6274,9 @@ def main(argv: list[str]) -> int:
         try:
             if wf is not None:
                 out = normalize_result(h, wf)
+                emitted_tuning = out.get("tuning_skillset") or {}
+                if emitted_tuning.get("gate") == "accepted":
+                    verify_runtime_tuning(emitted_tuning, Path(out.get("eval_dir") or eval_dir_hint), out["accepted_config"]["env_map"])
                 if wf.get("recovered_from_disk"):
                     out["recovered_from_disk"] = True
             else:

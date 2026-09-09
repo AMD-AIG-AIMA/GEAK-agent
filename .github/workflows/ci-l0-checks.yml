@@ -113,6 +113,7 @@ jobs:
             e2e_workflow/scripts/tests/test_server_teardown.py \
             e2e_workflow/scripts/tests/test_bench_e2e_teardown_lookup.py \
             e2e_workflow/scripts/tests/test_tuning_skillset_sync.py \
+            e2e_workflow/scripts/tests/test_runtime_csv.py \
             ci/node/test_run_model_material_audit.py \
             perf_knowledge/expert_skills/_contribute/test_flydsl_skill_portability.py \
             perf_knowledge/expert_skills/_contribute/test_tuning_index.py \
