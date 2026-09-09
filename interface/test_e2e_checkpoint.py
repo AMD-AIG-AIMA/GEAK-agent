@@ -368,6 +368,54 @@ def test_tuning_markdown_recovery_requires_explicit_accepted_gate(tmp_path):
     assert rx._recover_tuning_report(eval_dir) is None
 
 
+def test_tuning_recovery_overlay_must_be_a_live_local_directory(tmp_path):
+    eval_dir = tmp_path / "e2e_interrupted"
+    overlay = eval_dir / "tuning" / "overlay"
+    overlay.mkdir(parents=True)
+
+    assert rx._tuning_recovery_overlay(eval_dir, {"apply_overlay": "tuning/overlay"}) == str(
+        overlay.resolve()
+    )
+    assert rx._tuning_recovery_overlay(eval_dir, {"apply_overlay": "../outside"}) is None
+    assert rx._tuning_recovery_overlay(eval_dir, {"apply_overlay": "tuning/missing"}) is None
+
+
+def test_tuning_recovery_launcher_requires_deploy_and_bench(tmp_path):
+    eval_dir = tmp_path / "e2e_interrupted"
+    assert rx._write_tuning_recovery_launcher(eval_dir) == ""
+
+
+def test_recovered_tuning_material_uses_deployment_descriptor_when_ops_missing(tmp_path):
+    rows = rx._recovered_tuning_material(
+        {}, tmp_path / "e2e_interrupted", 1.1, source="markdown_report"
+    )
+
+    assert rows == [{
+        "short_name": "tuning_data_deployment",
+        "op_kind": "tuning_data_deployment",
+        "backend": "tuning_skillset",
+        "artifact": str(tmp_path / "e2e_interrupted" / "tuning" / "deploy"),
+        "e2e_delta_pct": 10.0,
+        "from_tuning_skillset": True,
+        "recovery_source": "markdown_report",
+        "provisional": True,
+    }]
+
+
+def test_tuning_markdown_recovery_rejects_missing_pair_and_inconsistent_speedup(tmp_path):
+    eval_dir = tmp_path / "e2e_interrupted"
+    _tuning_recovery_runtime(eval_dir)
+    report = eval_dir / "tuning" / "tuning_report.md"
+    report.write_text("**Outcome: accepted.** no final pair\n", encoding="utf-8")
+    assert rx._recover_tuning_report(eval_dir) is None
+
+    report.write_text(
+        "**Outcome: accepted.** (1000 -> 1100 tok/s), speedup = 1.5x\n",
+        encoding="utf-8",
+    )
+    assert rx._recover_tuning_report(eval_dir) is None
+
+
 def test_recovers_legacy_tuning_composite_as_provisional(tmp_path):
     eval_dir = tmp_path / "e2e_interrupted"
     deploy = _tuning_recovery_runtime(eval_dir)
