@@ -488,6 +488,10 @@ class TestBenchClient(_RunE2ECase):
                     "duration_s": 3600,
                     "geak_loop_duration_s": 900,
                     "concurrency": 8,
+                    # The orchestrator names the axis it graded on; the replay
+                    # client has to measure that same axis or the two harnesses
+                    # report different quantities under one name.
+                    "metric_basis": "aggregate_output_tok_s",
                 }
             }
         )
@@ -495,6 +499,8 @@ class TestBenchClient(_RunE2ECase):
         self.assertEqual(os.environ["GEAK_ISL_OSL_INACTIVE"], "1")
         self.assertEqual(os.environ["AGENTX_DATASET"], "semianalysis_cc_traces_weka_062126")
         self.assertEqual(exported["REPEATS"], "1")
+        self.assertEqual(os.environ["GEAK_METRIC_BASIS"], "aggregate_output_tok_s")
+        self.assertEqual(exported["GEAK_METRIC_BASIS"], "aggregate_output_tok_s")
 
     def test_apply_workload_spec_noop_on_synthetic_handoff(self):
         os.environ.pop("GEAK_WORKLOAD_KIND", None)
