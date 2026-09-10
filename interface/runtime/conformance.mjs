@@ -219,7 +219,10 @@ function stripCommentsAndStrings(src) {
     // reported as a novel Workflow primitive. Runs before the quote passes so a regex holding
     // a ' or " is dropped whole; the leading-token guard is what keeps a division (`a / b`)
     // and a path inside a string from being eaten as a literal.
-    .replace(/([(,=:[!&|?{};]|=>|\breturn\b|^)(\s*)\/(?![*/])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n])+\/[gimsuy]*/gm,
+    // `[` is excluded from the catch-all alternative on purpose: it can only ever open a
+    // character class, and leaving it in BOTH branches makes every `[]` a fork the engine
+    // must backtrack through — exponential on input like `[][][]...` (CodeQL ReDoS).
+    .replace(/([(,=:[!&|?{};]|=>|\breturn\b|^)(\s*)\/(?![*/])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\\\n[])+\/[gimsuy]*/gm,
       '$1$2 /RE/ ')
     .replace(/`(?:\\[\s\S]|[^`\\])*`/g, ' `` ')        // template literals (drops prompt prose)
     .replace(/'(?:\\.|[^'\\])*'/g, ' "" ')             // single-quoted

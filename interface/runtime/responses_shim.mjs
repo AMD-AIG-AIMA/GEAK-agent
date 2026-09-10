@@ -147,9 +147,11 @@ const server = http.createServer((req, res) => {
       if (!wantStream) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(json)); return; }
       streamResponsesObject(res, json);
     } catch (e) {
+      // The detail stays in the local log; the body goes back over the wire, so it
+      // carries only a fixed string.
       log('ERROR ' + (e.message || e));
       if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: String(e.message || e) } }));
+      res.end(JSON.stringify({ error: { message: 'upstream request failed (see shim.log)' } }));
     }
   });
 });

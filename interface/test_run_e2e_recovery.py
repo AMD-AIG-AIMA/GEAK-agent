@@ -891,7 +891,7 @@ def test_emit_timeout_still_writes_journey(monkeypatch, tmp_path):
     eval_dir = tmp_path / "e2e_to"
     eval_dir.mkdir()
 
-    def boom(prompt, t, ed):
+    def boom(prompt, t, ed, ps_args=None):
         raise TimeoutError("signal 15: self-stop to flush interface files")
 
     rc, rp = _run_main(monkeypatch, tmp_path, eval_dir, invoke=boom)
