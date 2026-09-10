@@ -88,7 +88,7 @@ class MagpieLauncherExtraArgsTest(unittest.TestCase):
 
     def _launch(self, *, backend="vllm", extra_server_args="",
                 recipe=None, outer_rocr=None, extra_env=None,
-                profile="0", pythonpath=None, overlay_pythonpath=None):
+                profile="0", pythonpath=None, overlay_pythonpath=None, expect_failure=False):
         env = dict(os.environ)
         for k in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
                   "CUDA_VISIBLE_DEVICES", "RECIPE_ENV_FILE",
@@ -119,6 +119,10 @@ class MagpieLauncherExtraArgsTest(unittest.TestCase):
             [BASH, self.driver], env=env, cwd=self.tmp,
             capture_output=True, text=True, timeout=60,
         )
+        if expect_failure:
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertFalse(os.path.exists(self.capture), "invalid env must not launch a child")
+            return {}, proc
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:] + proc.stdout[-2000:])
         captured = {}
         with open(self.capture, encoding="utf-8") as fh:
@@ -200,32 +204,12 @@ class MagpieLauncherExtraArgsTest(unittest.TestCase):
         self.assertEqual(cap["HIP_VISIBLE_DEVICES"], "1")         # logical pin, not 99
         self.assertEqual(cap["FOO"], "fromextra")
 
-    def test_extra_env_split_string_option_cannot_reinject_mask(self):
-        """`env` parses a leading-dash EXTRA_ENV token as an OPTION, not an
-        assignment: `-SCUDA_VISIBLE_DEVICES=7` (-S/--split-string) would re-inject
-        a mask that a plain `CUDA_...=` content filter never sees. Such tokens
-        must be dropped, so the mask stays pinned/cleared."""
-        cap, _ = self._launch(
-            outer_rocr="4,5,6,7",
-            extra_env="-SCUDA_VISIBLE_DEVICES=7 FOO=kept",
-        )
-        self.assertEqual(cap["CUDA_VISIBLE_DEVICES"], "<unset>")   # not 7
-        self.assertEqual(cap["ROCR_VISIBLE_DEVICES"], "4,5,6,7")
-        self.assertEqual(cap["HIP_VISIBLE_DEVICES"], "1")
-        self.assertEqual(cap["FOO"], "kept")                       # legit var survives
-
-    def test_extra_env_split_string_option_bare_box(self):
-        cap, _ = self._launch(extra_env="-SHIP_VISIBLE_DEVICES=9 FOO=kept")
-        self.assertEqual(cap["HIP_VISIBLE_DEVICES"], "<unset>")    # not 9
-        self.assertEqual(cap["ROCR_VISIBLE_DEVICES"], "1")
-        self.assertEqual(cap["FOO"], "kept")
-
-    def test_extra_env_bare_word_is_dropped_not_run_as_command(self):
-        """A token with no `=` would be `env`'s COMMAND to exec; it must be
-        dropped so the real server script still launches."""
-        cap, proc = self._launch(extra_env="notanassignment FOO=kept")
-        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertEqual(cap["FOO"], "kept")
+    def test_malformed_extra_env_stops_before_server_launch(self):
+        for raw in ("-SCUDA_VISIBLE_DEVICES=7 FOO=kept", "-SHIP_VISIBLE_DEVICES=9 FOO=kept",
+                    "notanassignment FOO=kept"):
+            with self.subTest(raw=raw):
+                _, proc = self._launch(extra_env=raw, expect_failure=True)
+                self.assertIn("invalid EXTRA_ENV", proc.stderr)
 
     def test_extra_env_value_is_not_pathname_expanded(self):
         """Unquoted `${EXTRA_ENV}` used to glob before validation.
