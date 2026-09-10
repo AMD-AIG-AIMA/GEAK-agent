@@ -138,3 +138,62 @@ def test_workflow_verification_cli_reads_literal_paths(tmp_path):
     child = subprocess.run([sys.executable, "-S", str(script), "--verify-tuning", "--eval-dir", str(tmp_path)],
                            input=json.dumps(tuning), text=True, capture_output=True, check=True)
     assert json.loads(child.stdout) == [table]
+
+
+def test_cli_build_then_verify_preserves_literal_bundle_selection(tmp_path, monkeypatch, capsys):
+    import io
+
+    from e2e_workflow.scripts import runtime_csv
+
+    baseline, tuned = tables(tmp_path)
+    output = tmp_path / "bundle ' literal"
+    monkeypatch.setattr(sys, "argv", [
+        "runtime_csv.py", "--baseline", str(baseline), "--tuned", str(tuned),
+        "--output", str(output), "--env-name", ENV, "--keys", ",".join(KEYS),
+    ])
+    runtime_csv.main()
+    table = json.loads(capsys.readouterr().out)
+    assert table["candidate"]["rows"] == 3
+    tuning = {"runtime_csv_manifests": [str(output / "runtime_csv.json")], "apply_env": table["apply_env"]}
+    monkeypatch.setattr(sys, "argv", ["runtime_csv.py", "--verify-tuning", "--eval-dir", str(tmp_path)])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(tuning)))
+    runtime_csv.main()
+    assert json.loads(capsys.readouterr().out) == [table]
+
+
+@pytest.mark.parametrize("argv", [[], ["--verify-tuning"]])
+def test_incomplete_cli_request_fails_before_building(argv, monkeypatch):
+    from e2e_workflow.scripts import runtime_csv
+
+    monkeypatch.setattr(sys, "argv", ["runtime_csv.py", *argv])
+    with pytest.raises(SystemExit) as exc:
+        runtime_csv.main()
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("tuning", [
+    {"live_tree_files": ["/workspace/aiter/configs/tuned.csv"]},
+    {"cache_invalidation": ["clear aiter_configs cache"]},
+])
+def test_installed_table_changes_cannot_bypass_runtime_manifest(tuning, tmp_path):
+    with pytest.raises(ValueError, match="complete per-process runtime CSVs"):
+        verify_runtime_tuning(tuning, tmp_path)
+
+
+@pytest.mark.parametrize("defect", ["selector", "keys", "empty", "nonfinite", "duplicate_columns"])
+def test_invalid_dispatch_contract_never_creates_a_candidate(tmp_path, defect):
+    baseline, tuned = tables(tmp_path)
+    selector, keys = ENV, KEYS
+    if defect == "selector":
+        selector = "PATH"
+    elif defect == "keys":
+        keys = ["missing_column"]
+    elif defect == "empty":
+        tuned.write_text(HEADER)
+    elif defect == "nonfinite":
+        tuned.write_text(HEADER + "gfx950,256,NaN,32,16,bad\n")
+    else:
+        tuned.write_text("M,M\n1,2\n")
+    with pytest.raises(ValueError):
+        build_runtime_csv(baseline, [tuned], tmp_path / "bundle", selector, keys)
+    assert not (tmp_path / "bundle").exists()

@@ -26,12 +26,12 @@ LITERALS = {
 
 def test_decoder_emits_only_nul_delimited_literal_assignments(monkeypatch, capsysbinary):
     decoder = runpy.run_path(str(SCRIPTS / "adapters/extra_env.py"))
-    raw = shlex.join(["SGLANG_TEST_CONFIG=two words\nsecond line", "AUDIT_EMPTY=", "-X=bad", "word"])
+    raw = shlex.join(["SGLANG_TEST_CONFIG=two words\nsecond line", "AUDIT_EMPTY="])
     monkeypatch.setattr(sys, "argv", ["extra_env.py", raw])
     decoder["main"]()
     captured = capsysbinary.readouterr()
     assert captured.out == b"SGLANG_TEST_CONFIG=two words\nsecond line\0AUDIT_EMPTY=\0"
-    assert b"'-X=bad'" in captured.err and b"'word'" in captured.err
+    assert captured.err == b""
 
 
 def test_decoder_rejects_malformed_quotes_without_partial_output(monkeypatch, capsysbinary):
@@ -132,11 +132,12 @@ def test_malformed_quotes_stop_before_child_launch(tmp_path, launcher):
 
 
 @pytest.mark.parametrize("launcher", LAUNCHERS)
-def test_invalid_identifiers_never_become_env_options_or_commands(tmp_path, launcher):
+def test_invalid_identifiers_stop_before_child_launch(tmp_path, launcher):
     raw = shlex.join(["A\n=bad", "-SCUDA_VISIBLE_DEVICES=7", "notanassignment", "RUN_EVAL=true"])
     result, capture = launch(tmp_path, launcher, raw, {"A\n": None, "RUN_EVAL": "true"})
-    assert result.returncode == 0, result.stderr + result.stdout
-    assert json.loads(capture.read_text())["env"] == {"A\n": None, "RUN_EVAL": "true"}
+    assert result.returncode != 0
+    assert "invalid EXTRA_ENV" in result.stderr
+    assert not capture.exists()
 
 
 @pytest.mark.parametrize("launcher", LAUNCHERS)

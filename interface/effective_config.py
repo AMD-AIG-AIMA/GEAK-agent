@@ -10,7 +10,6 @@ import copy
 import hashlib
 import json
 import shlex
-import sys
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -18,8 +17,6 @@ from typing import Any, Iterable, Mapping, MutableMapping, Optional, Union
 
 import yaml
 
-# run_e2e.py also loads this module directly from the interface/ directory.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from e2e_workflow.scripts.adapters.extra_env import (
     _protect_bare_json as _protect_bare_json,
 )
@@ -46,6 +43,7 @@ class EffectiveConfig:
     digest: str
     manifest: dict[str, Any]
     unset_envs: tuple[str, ...] = ()
+    remove_args: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached JSON-serialisable representation."""
@@ -153,6 +151,23 @@ def _parse_env(value: Any) -> "OrderedDict[str, str]":
             raise ValueError(f"environment entry must be KEY=VALUE: {token!r}")
         result[key] = item
     return result
+
+
+def resolve_remove_args(specs: Any, *assignments: Any) -> tuple[str, ...]:
+    """Keep removals that explicit current assignments have not re-enabled."""
+    if specs is None:
+        return ()
+    if isinstance(specs, str):
+        specs = [specs]
+    if not isinstance(specs, (list, tuple)) or any(not isinstance(s, str) for s in specs):
+        raise TypeError("remove_args must be a string or list of flag specs")
+    current = OrderedDict()
+    for args in assignments:
+        current.update(_flag_map(args))
+    return tuple(sorted({
+        _render_flags([flag]) for spec in specs for flag in _parse_flags(spec)
+        if flag.name not in current or (flag.value is not None and current[flag.name] != flag)
+    }))
 
 
 def resolve_unset_envs(names: Any, *environments: Any) -> tuple[str, ...]:
@@ -267,6 +282,7 @@ def resolve_effective_config(
     baseline_config = baseline.get("config") or {}
     legacy_server_args: Optional[str] = None
     unset_envs: tuple[str, ...] = ()
+    remove_args: tuple[str, ...] = ()
 
     if schema_version < 2:
         # Do not canonicalise or merge old handoffs: legacy consumers forwarded
@@ -325,7 +341,16 @@ def resolve_effective_config(
             kind="server_flag",
             conflicts=conflicts,
         )
-        _remove_flags(final_flags, baseline_config.get("remove_args"))
+        requested_removals = resolve_remove_args(baseline_config.get("remove_args"))
+        _remove_flags(final_flags, requested_removals)
+        remove_args = resolve_remove_args(requested_removals, _render_flags(delta_flags.values()))
+        for spec in sorted(set(requested_removals) - set(remove_args)):
+            flag = _parse_flags(spec)[0]
+            conflicts.append({
+                "kind": "server_flag", "key": flag.name,
+                "lower_source": "remove_args", "lower_value": spec,
+                "higher_source": "current_best_delta", "higher_value": delta_flags[flag.name].value,
+            })
         _merge_layer(
             final_flags,
             delta_flags,
@@ -383,6 +408,7 @@ def resolve_effective_config(
         "base_overlay_pythonpath": overlay,
         "source_snapshots": snapshots,
         "conflicts": conflicts,
+        "remove_args": list(remove_args),
     }
     if unset_envs:
         manifest["unset_envs"] = list(unset_envs)
@@ -400,6 +426,7 @@ def resolve_effective_config(
         digest=digest,
         manifest=manifest,
         unset_envs=unset_envs,
+        remove_args=remove_args,
     )
 
 

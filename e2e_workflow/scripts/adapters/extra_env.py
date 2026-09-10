@@ -100,10 +100,10 @@ def main() -> None:
     assignments = []
     for token in tokens:
         key, separator, _ = token.partition("=")
-        if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and "\0" not in token:
             assignments.append(token)
         else:
-            print(f"dropping non-assignment EXTRA_ENV token: {token!r}", file=sys.stderr)
+            raise ValueError(f"EXTRA_ENV entry must be KEY=VALUE without NUL: {token!r}")
     sys.stdout.buffer.write(b"".join(token.encode() + b"\0" for token in assignments))
 
 

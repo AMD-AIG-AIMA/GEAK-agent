@@ -36,7 +36,12 @@ Commands:
 Back-compat aliases: `monkeypatch` == add-rebind, `copy-subtree` == add-module (file granularity).
 Stdlib only.
 """
-import argparse, importlib, json, os, shutil, subprocess, sys
+import argparse
+import importlib
+import json
+import os
+import shutil
+import subprocess
 
 SITECUSTOMIZE = r'''# Auto-generated reversible overlay (e2e_workflow). Drop this dir from PYTHONPATH to revert.
 import json, os, sys, importlib, importlib.machinery, importlib.util
@@ -80,7 +85,14 @@ class _OverlayModuleFinder:
 _module_files = {}
 for _e in _m.get("modules", []):
     try:
-        _module_files[_e["module"]] = os.path.join(_HERE, _e["file"])
+        _name = _e["module"]
+        _file = os.path.join(_HERE, _e["file"])
+        if _name.split(".")[-1] == "__init__" or os.path.basename(_file) == "__init__.py":
+            raise ValueError("package __init__.py replacement is unsupported")
+        if _name in sys.modules and getattr(sys.modules[_name], "__file__", None) != _file:
+            sys.stderr.write("[overlay] module registration FAILED %s: target already imported before overlay registration\n" % _name)
+            continue
+        _module_files[_name] = _file
     except Exception as _ex:
         sys.stderr.write("[overlay] module registration FAILED %r: %r\n" % (_e, _ex))
 if _module_files:
@@ -188,6 +200,20 @@ def _try_apply(patch, target_file=None, cwd=None):
 
 
 def cmd_add_module(a):
+    for filename in (a.patched_file, getattr(a, "src_file", "")):
+        if filename and os.path.basename(filename) == "__init__.py":
+            raise SystemExit("add-module does not support package __init__.py replacement")
+    search_path = None
+    spec = None
+    for index, part in enumerate(a.module.split("."), 1):
+        spec = importlib.machinery.PathFinder.find_spec(".".join(a.module.split(".")[:index]), search_path)
+        if spec is None:
+            break
+        search_path = spec.submodule_search_locations
+        if search_path is None:
+            break
+    if a.module.split(".")[-1] == "__init__" or (spec and spec.submodule_search_locations is not None):
+        raise SystemExit("add-module does not support package __init__.py replacement")
     man = _ensure_overlay(a.overlay, getattr(a, "base", ""))
     patched_dir = os.path.join(a.overlay, "_patched")
     os.makedirs(patched_dir, exist_ok=True)

@@ -121,6 +121,23 @@ class TestModuleStartup(unittest.TestCase):
         process = self.run_python("from probe_pkg.target import entry\nassert entry() == 'patched-other'\n")
         self.assert_success(process)
 
+    def test_already_imported_stock_module_is_reported(self):
+        process = self.run_python("""
+            import runpy, sys, types
+            sys.modules['probe_pkg.target'] = types.ModuleType('probe_pkg.target')
+            runpy.run_path('overlay/sitecustomize.py')
+            assert not hasattr(sys.modules['probe_pkg.target'], 'entry')
+        """)
+        self.assert_success(process)
+        self.assertIn('target already imported before overlay registration', process.stderr)
+
+    def test_package_initializer_replacement_is_rejected(self):
+        with self.assertRaisesRegex(SystemExit, 'package __init__.py'):
+            SETUP.cmd_add_module(type('Args', (), {
+                'module': 'probe_pkg', 'overlay': str(self.overlay),
+                'patched_file': str(self.installed / 'probe_pkg/__init__.py'),
+            })())
+
     def test_mixed_module_and_rebind_keeps_existing_rebind_activation(self):
         self.write("overlay/rebound_impl.py", "def replacement():\n    return 'rebound'\n")
         manifest_path = self.overlay / "_overlay_manifest.json"

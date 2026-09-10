@@ -571,6 +571,7 @@ const INIT_ENV = String(A.initial_extra_env || '');
 const INIT_ARGS_MODE = A.initial_args_mode === 'replace' ? 'replace' : 'append';
 const INIT_ENV_COMPLETE = A.initial_env_complete === true || A.initial_env_complete === 'true';
 const INIT_UNSET_ENVS = Array.isArray(A.initial_unset_envs) ? A.initial_unset_envs : [];
+const INIT_REMOVE_ARGS = Array.isArray(A.initial_remove_args) ? A.initial_remove_args : [];
 // Schema-v2 handoffs may carry the exact Python overlay/source snapshot stack
 // that produced Hyperloom's current best.  This is part of the baseline
 // configuration, not a GEAK-authored candidate, so it must remain underneath
@@ -2205,6 +2206,7 @@ let KB_REF_INPUTS = {};
 
 let EVAL_DIR, MODEL_NAME, BASELINE_TPUT, NOISE_BAND, curFlags, curEnv, curOverlay, profile, strategy, kernelQueue, headQueue;
 let curUnsetEnvs = [];
+let curRemoveArgs = [];
 let curArgsMode = 'append';
 if (want('setup')) {
   phase('Setup');
@@ -2230,6 +2232,7 @@ if (want('setup')) {
     : INIT_FLAGS || (setup.server_flags && setup.server_flags.extra) || '';
   curEnv = INIT_ENV_COMPLETE ? INIT_ENV : INIT_ENV || (setup.server_env || '');
   curUnsetEnvs = [...INIT_UNSET_ENVS];
+  curRemoveArgs = [...INIT_REMOVE_ARGS];
   curOverlay = INIT_BASE_OVERLAY;
   log(`Setup done. EVAL_DIR=${EVAL_DIR}, baseline ${BASELINE_TPUT} tok/s (noise band ${NOISE_BAND}%)`);
 
@@ -2512,7 +2515,7 @@ if (want('setup')) {
             baseline_throughput_tok_s: BASELINE_TPUT, final_throughput_tok_s: measured,
             throughput_speedup: BASELINE_TPUT ? measured / BASELINE_TPUT : 1,
             baseline_config: { flags: INIT_FLAGS, env: INIT_ENV },
-            accepted_config: { flags: curFlags, env: curEnv, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
+            accepted_config: { flags: curFlags, env: curEnv, remove_args: curRemoveArgs, unset_envs: curUnsetEnvs, args_mode: curArgsMode, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
             accepted_kernels: [], accepted_heads: [], final_patch: [],
             final_overlay: { path: curOverlay },
             final_launch_script: { path: `${EVAL_DIR}/bench_e2e.sh` },
@@ -3044,6 +3047,7 @@ if (want('setup')) {
   curFlags = ST.flags || '';
   curEnv = ST.env || '';
   curUnsetEnvs = Array.isArray(ST.unset_envs) ? ST.unset_envs : [];
+  curRemoveArgs = Array.isArray(ST.remove_args) ? ST.remove_args : [];
   curArgsMode = ST.args_mode === 'replace' ? 'replace' : 'append';
   curOverlay = ST.overlay || INIT_BASE_OVERLAY;
   profile = { profile_topN_json: ST.profile_topn_json || '' };
@@ -3080,7 +3084,7 @@ if (want('config') && CONFIG_TUNE_ENABLED && strategy && (strategy.config_direct
       baseline_throughput_tok_s: BASELINE_TPUT, final_throughput_tok_s: curTput,
       throughput_speedup: BASELINE_TPUT ? curTput / BASELINE_TPUT : 1,
       baseline_config: { flags: INIT_FLAGS, env: INIT_ENV },
-      accepted_config: { flags: curFlags, env: curEnv, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
+      accepted_config: { flags: curFlags, env: curEnv, remove_args: curRemoveArgs, unset_envs: curUnsetEnvs, args_mode: curArgsMode, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
       accepted_kernels: [], accepted_heads: [], final_patch: [], final_overlay: { path: curOverlay },
       final_launch_script: { path: `${EVAL_DIR}/bench_e2e.sh` },
       bench_script: { path: `${EVAL_DIR}/bench_e2e.sh` },
@@ -3387,7 +3391,7 @@ if (want('tune') && TUNING_SKILLSET_ENABLED) {
       throughput_speedup: tuning.tuning_speedup ||
         (tuning.post_tune_throughput_tok_s / tuning.pre_tune_throughput_tok_s),
       baseline_config: tuningBaselineConfig,
-      accepted_config: { flags: curFlags, env: curEnv, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
+      accepted_config: { flags: curFlags, env: curEnv, remove_args: curRemoveArgs, unset_envs: curUnsetEnvs, args_mode: curArgsMode, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
       accepted_kernels: tunedOps.map((o) => ({
         kernel_id: o.kernel_id || o.op || o.short_name || '',
         kernel_slot: o.kernel_slot || o.target_callable || o.target_file || o.op || o.short_name || '',
@@ -4728,7 +4732,7 @@ if (allAccepted.length) {
     baseline_throughput_tok_s: BASELINE_TPUT, final_throughput_tok_s: curTput,
     throughput_speedup: BASELINE_TPUT ? curTput / BASELINE_TPUT : 1,
     baseline_config: { flags: INIT_FLAGS, env: INIT_ENV },
-    accepted_config: { flags: curFlags, env: curEnv, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
+    accepted_config: { flags: curFlags, env: curEnv, remove_args: curRemoveArgs, unset_envs: curUnsetEnvs, args_mode: curArgsMode, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
     accepted_kernels: acceptedKernels, accepted_heads: acceptedHeads, final_patch: [],
     final_overlay: { path: curOverlay },
     final_launch_script: { path: `${EVAL_DIR}/bench_e2e.sh` },
@@ -4763,7 +4767,7 @@ if (want('final')) {
       baseline_throughput_tok_s: BASELINE_TPUT, final_throughput_tok_s: finalTput,
       throughput_speedup: BASELINE_TPUT ? finalTput / BASELINE_TPUT : 1,
       baseline_config: { flags: INIT_FLAGS, env: INIT_ENV },
-      accepted_config: { flags: curFlags, env: curEnv, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
+      accepted_config: { flags: curFlags, env: curEnv, remove_args: curRemoveArgs, unset_envs: curUnsetEnvs, args_mode: curArgsMode, effective_config_digest: EFFECTIVE_CONFIG_DIGEST },
       accepted_kernels: acceptedKernels, accepted_heads: acceptedHeads,
       final_patch: [finalize.final_patch].filter(Boolean),
       final_overlay: { path: finalize.final_overlay || curOverlay },
@@ -4793,7 +4797,7 @@ if (want('final')) {
       'who cannot see it cannot tell "no prior art" from "prior art one segment away".', {
       EVAL_DIR, HISTORY: history, BASELINE_THROUGHPUT: BASELINE_TPUT, FINAL_THROUGHPUT: finalTput,
       KB_RECALL,
-      ACCEPTED_CONFIG: { flags: curFlags, env: curEnv, unset_envs: curUnsetEnvs }, ACCEPTED_KERNELS: allAccepted,
+      ACCEPTED_CONFIG: { flags: curFlags, env: curEnv, unset_envs: curUnsetEnvs, remove_args: curRemoveArgs, args_mode: curArgsMode }, ACCEPTED_KERNELS: allAccepted,
       ACCEPTED_HEADS: acceptedHeads, FLAGGED_HEADS: flaggedHeads, MILESTONES: milestone, BUDGET_USED: dispatched, BUDGET, MIN_KERNEL_TASKS,
       PROFILE_TOPN: profile ? profile.profile_topN_json : '', WORKLOAD, MODEL_NAME, SKILL_DIR: WORKFLOW_DIR,
       ...ANALYSIS_SKILL_INPUTS, ...TUNING_REPORT_INPUTS,
@@ -4810,7 +4814,7 @@ if (want('final')) {
       EVAL_DIR, MODEL_PATH, GPU_ID: GPU_LIST[0], BASELINE_THROUGHPUT: BASELINE_TPUT, NOISE_BAND_PCT: NOISE_BAND,
       BASELINE_OVERLAY: INIT_BASE_OVERLAY,
       FINAL_OVERLAY: (finalize && finalize.final_overlay) || curOverlay,
-      FINAL_FLAGS: { flags: curFlags, env: curEnv, unset_envs: curUnsetEnvs },
+      FINAL_FLAGS: { flags: curFlags, env: curEnv, unset_envs: curUnsetEnvs, remove_args: curRemoveArgs, args_mode: curArgsMode },
       CLAIMED_THROUGHPUT: finalTput, WORKLOAD, APPLY_TO_ORIGINAL,
       MEASUREMENT_MODE: VALIDATION_MEASUREMENT_MODE,
       MEASUREMENT_PURPOSE: 'validation', REPLICAS: VALIDATION_SAMPLES,
@@ -4878,6 +4882,7 @@ const carryState = {
   eval_dir: EVAL_DIR, model_name: MODEL_NAME, baseline_throughput_tok_s: BASELINE_TPUT,
   noise_band_pct: NOISE_BAND, flags: curFlags, env: curEnv, overlay: curOverlay, throughput: curTput,
   ...(curUnsetEnvs.length ? { unset_envs: curUnsetEnvs } : {}),
+  ...(curRemoveArgs.length || curArgsMode === 'replace' ? { remove_args: curRemoveArgs } : {}),
   ...(curArgsMode === 'replace' ? { args_mode: 'replace' } : {}),
   profile_topn_json: profile ? profile.profile_topN_json : '',
   config_directions: (strategy && strategy.config_directions) || [],
@@ -4986,6 +4991,7 @@ const wfReturn = {
   output_parity: validation ? validation.output_parity : 'unknown',
   accepted_config: { flags: curFlags, env: curEnv,
     ...(curUnsetEnvs.length ? { unset_envs: curUnsetEnvs } : {}),
+    ...(curRemoveArgs.length || curArgsMode === 'replace' ? { remove_args: curRemoveArgs } : {}),
     ...(curArgsMode === 'replace' ? { args_mode: 'replace' } : {}) },
   accepted_kernels: acceptedKernels,
   accepted_heads: acceptedHeads,

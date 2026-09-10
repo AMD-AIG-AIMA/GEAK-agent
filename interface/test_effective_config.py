@@ -164,6 +164,38 @@ def test_unsets_are_explicit_and_later_assignments_win(tmp_path):
     assert added.unset_envs == ("AMBIENT_ONLY",)
 
 
+def test_reenabled_removal_is_auditable_and_not_returned_as_active():
+    h = _handoff("", launch="--keep 1 --disabled", extra="--disabled")
+    h["baseline_env_spec"]["config"]["remove_args"] = ["--disabled", "--absent"]
+    resolved = resolve_effective_config(h)
+    assert shlex.split(resolved.final_server_args) == ["--keep", "1", "--disabled"]
+    assert resolved.remove_args == ("--absent",)
+    assert resolved.manifest["remove_args"] == ["--absent"]
+    assert resolved.conflicts == [{
+        "kind": "server_flag", "key": "--disabled", "lower_source": "remove_args",
+        "lower_value": "--disabled", "higher_source": "current_best_delta", "higher_value": None,
+    }]
+
+
+def test_import_does_not_change_global_module_search_path():
+    import subprocess
+    import sys
+    subprocess.run([sys.executable, "-c",
+        "import sys; before=list(sys.path); import interface.effective_config; assert sys.path == before"],
+        cwd=Path(__file__).resolve().parents[1], check=True)
+
+
+def test_complete_result_normalizes_removal_controls():
+    from interface.run_e2e import _accepted_config_with_env_map
+    result = _accepted_config_with_env_map({
+        "flags": "--keep 2", "env": "RESET=2", "args_mode": "replace",
+        "remove_args": ["--keep", "--absent"], "unset_envs": ["RESET", "ABSENT"],
+    })
+    assert result["args_mode"] == "replace"
+    assert result["remove_args"] == ["--absent"]
+    assert result["unset_envs"] == ["ABSENT"]
+
+
 def test_absent_environment_and_explicit_ambient_removal_have_different_digests():
     h = _handoff("")
     original = resolve_effective_config(h)

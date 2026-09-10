@@ -2,6 +2,10 @@
 _GEAK_EXTRA_ENV_PARSER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/extra_env.py"
 
 geak_read_extra_env() {
+  if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    echo "GEAK environment transport requires Bash >= 4.4 (mapfile -d)" >&2
+    return 2
+  fi
   # A checked temporary file keeps parser failure distinct from an empty result.
   # Process substitution would discard that failure and launch with missing env.
   local _geak_env_file _geak_env_rc

@@ -19,12 +19,12 @@ const setupInputs = between('      LAUNCH_SCRIPT, MODEL_PATH, EXP_ROOT,', "     
 const setup = between('  // An explicitly complete seed', '  curOverlay = INIT_BASE_OVERLAY;');
 const resume = between("  curFlags = ST.flags || '';", '  curOverlay = ST.overlay || INIT_BASE_OVERLAY;');
 const state = between('const carryState = {', '// What this run got from the KB');
-const accepted = between('  accepted_config: { flags: curFlags', '  accepted_kernels: acceptedKernels,');
+const accepted = between('\n  accepted_config: { flags: curFlags', '  accepted_kernels: acceptedKernels,');
 
 function run(args = {}, carried = null, setupFlags = '--disable-cuda-graph') {
   const context = {
     A: args, ST: carried || {}, setup: { server_flags: { extra: setupFlags }, server_env: 'RECIPE=1' },
-    curArgsMode: 'append', curFlags: '', curEnv: '', curUnsetEnvs: [], curOverlay: '', curTput: 100,
+    curArgsMode: 'append', curFlags: '', curEnv: '', curUnsetEnvs: [], curRemoveArgs: [], curOverlay: '', curTput: 100,
     BACKEND: 'sglang', EVAL_DIR: '/eval', MODEL_NAME: 'test', BASELINE_TPUT: 100,
     NOISE_BAND: 0.5, profile: {}, strategy: {}, headQueue: [], kernelQueue: [],
     acceptedHeads: [], flaggedHeads: [], acceptedKernels: [], tuning: null,
@@ -41,7 +41,7 @@ function run(args = {}, carried = null, setupFlags = '--disable-cuda-graph') {
 function test() {
   const flags = '--context-length 9728 --cuda-graph-max-bs 64';
   const complete = run({ initial_extra_server_args: flags, initial_args_mode: 'replace' });
-  assert.deepEqual(complete.accepted_config, { flags, env: 'RECIPE=1', args_mode: 'replace' });
+  assert.deepEqual(complete.accepted_config, { flags, env: 'RECIPE=1', args_mode: 'replace', remove_args: [] });
   assert(!complete.accepted_config.flags.includes('--disable-cuda-graph'));
   assert.equal(complete.state.args_mode, 'replace');
   assert.equal(complete.setup_inputs.INIT_ARGS_MODE, 'replace');
@@ -83,7 +83,12 @@ function test() {
   assert.deepEqual(run({}, unset.state).accepted_config, unset.accepted_config);
   assert(!Object.hasOwn(run({ initial_unset_envs: ['NEW'] }, { flags: '', env: '' }).accepted_config, 'unset_envs'),
     'older carried state does not acquire a new handoff removal');
-  console.log('11 shipped workflow configuration transport cases passed');
+  const removed = run({ initial_extra_server_args: '--keep 1', initial_args_mode: 'replace',
+    initial_remove_args: ['--disable-radix-cache'] });
+  assert.deepEqual(removed.accepted_config.remove_args, ['--disable-radix-cache']);
+  assert.deepEqual(run({}, removed.state).accepted_config, removed.accepted_config);
+  assert(!Object.hasOwn(run({ initial_remove_args: ['--new'] }, { flags: '', env: '' }).accepted_config, 'remove_args'));
+  console.log('12 shipped workflow configuration transport cases passed');
 }
 
 module.exports = { run };

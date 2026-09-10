@@ -45,14 +45,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_launch_import_path = sys.path[:]
 try:
-    # Package import under pytest / module use.
-    from interface.effective_config import resolve_effective_config, resolve_unset_envs
-except ModuleNotFoundError:  # Direct: python interface/run_e2e.py ...
-    from effective_config import resolve_effective_config, resolve_unset_envs
-
-from e2e_workflow.scripts.adapters.extra_env import parse_unset_envs
-from e2e_workflow.scripts.runtime_csv import verify_runtime_tuning
+    if not __package__:  # Direct: python interface/run_e2e.py ...
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from e2e_workflow.scripts.adapters.extra_env import parse_unset_envs
+    from e2e_workflow.scripts.runtime_csv import verify_runtime_tuning
+    from interface.effective_config import (
+        resolve_effective_config,
+        resolve_remove_args,
+        resolve_unset_envs,
+    )
+finally:
+    sys.path[:] = _launch_import_path
+del _launch_import_path
 
 SCHEMA_VERSION = 2
 KERNEL_JOURNEY_SCHEMA_VERSION = 1
@@ -288,6 +294,8 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
     workload = h.get("workload") or {}
     tp = int(h.get("tp", 1) or 1)
     effective = None
+    if int(h.get("schema_version", 1) or 1) >= 2 and not isinstance(h.get("baseline_env_spec"), dict):
+        print("WARNING: schema >= 2 handoff lacks baseline_env_spec; launch controls cannot be resolved", file=sys.stderr)
     if int(h.get("schema_version", 1) or 1) >= 2 and isinstance(
         h.get("baseline_env_spec"), dict
     ):
@@ -368,6 +376,7 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
         ps_args["effective_config_digest"] = effective.digest
         ps_args["initial_args_mode"] = "replace"
         ps_args["initial_env_complete"] = True
+        ps_args["initial_remove_args"] = list(effective.remove_args)
         if effective.unset_envs:
             ps_args["initial_unset_envs"] = list(effective.unset_envs)
     # Forward the orchestrator's HARD wall-clock budget (the same timeout_s this
@@ -2573,6 +2582,10 @@ def _accepted_config_with_env_map(config: dict) -> dict:
     out = dict(config)
     env_map, rejected = _parse_env_assignments(out.get("env"))
     out["env_map"] = env_map
+    if "remove_args" in out:
+        out["remove_args"] = list(resolve_remove_args(out["remove_args"], out.get("flags")))
+    if "unset_envs" in out:
+        out["unset_envs"] = list(resolve_unset_envs(out["unset_envs"], env_map))
     if rejected:
         out["env_unparsed"] = rejected
     return out
@@ -3158,6 +3171,9 @@ def normalize_result(h: dict, wf: dict) -> dict:
         else:
             seed = h.get("state") or {}
             unsets = set(resolve_unset_envs(seed.get("unset_envs"), seed.get("env")))
+        removals = (*resolve_remove_args(seed.get("remove_args")),
+                    *resolve_remove_args(accepted_config.get("remove_args")))
+        accepted_config["remove_args"] = list(resolve_remove_args(removals, accepted_config.get("flags")))
         unsets.update(parse_unset_envs(accepted_config.get("unset_envs")))
         unsets.difference_update(accepted_config["env_map"])
         if unsets:
