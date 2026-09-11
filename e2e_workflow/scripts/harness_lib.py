@@ -1523,13 +1523,18 @@ def assert_baseline_dispatch(task_dir, base, meta, timeout=600):
             "so its speedup is a DISPATCH FLIP, not an optimization. Causes, in order: (1) the oracle "
             "lost a loader-set weight attribute that gates the backend — recapture, or declare it in "
             "meta.live_tensor_attrs and apply it with apply_declared_attrs after rehydration; "
-            "(2) meta.capture_env differs from this process's env; (3) meta.device_kernel names a "
-            "kernel the selected seam does not reach. Do NOT 'fix' this by exporting a tuned config "
-            "the captured server did not have — that is a THIRD code path.")
+            "(2) meta.capture_env differs from this process's env; (3) the captured shapes never reach "
+            "the bucket the name came from — if the observed list holds the SAME kernel family at a "
+            "different tile, device_kernel was taken from a profile bucket this oracle did not capture, "
+            "so recapture that bucket rather than renaming; (4) meta.device_kernel names a kernel the "
+            "selected seam does not reach at all. Do NOT 'fix' this by exporting a tuned config the "
+            "captured server did not have — that is a THIRD code path.")
         print(f"{UT_HARNESS_INCOMPLETE_SENTINEL}: {reason}")
         raise HarnessIncompleteError(reason)
+    # Reported, not raised on: one bucket legitimately reaching a different tile of the same family is
+    # shape-dependent dispatch, but it does mean the name does not describe every case being timed.
     return {"checked": True, "device_kernel": want, "matched_cases": sorted(hit),
-            "per_case": per_case}
+            "unmatched_cases": sorted(set(per_case) - set(hit)), "per_case": per_case}
 
 
 def _median(xs):
