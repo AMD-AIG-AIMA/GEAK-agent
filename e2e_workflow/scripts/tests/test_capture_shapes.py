@@ -613,6 +613,16 @@ class TestFlush(_RecorderTestCase):
         self.assertEqual(env.get("VLLM_USE_FLYDSL"), "1")
         self.assertNotIn("HOME", env)
 
+    def test_a_credential_that_matches_the_prefixes_is_recorded_by_name_only(self):
+        """`GEAK_KB_STORE_TOKEN` matches `^GEAK_`, this runs inside the SERVER process, and meta.json
+        travels with the task dir into the KB. The name is dispatch-relevant; the value is a secret."""
+        self._drive()
+        with _env(GEAK_KB_STORE_TOKEN="s3cr3t", AITER_CONFIG_FMOE="/tmp/t.csv"), _stderr():
+            cs._flush()
+        env = self._meta()["capture_env"]
+        self.assertEqual(env.get("GEAK_KB_STORE_TOKEN"), "<redacted>")
+        self.assertEqual(env.get("AITER_CONFIG_FMOE"), "/tmp/t.csv")
+
     def test_cases_carry_shapes_dtypes_and_their_real_call_count(self):
         self._drive()
         with _stderr():

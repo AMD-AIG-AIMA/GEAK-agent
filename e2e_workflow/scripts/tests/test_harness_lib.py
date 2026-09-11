@@ -2394,6 +2394,20 @@ class TestBaselineDispatchGate(_HarnessTestCase):
             got = hl.assert_baseline_dispatch("/t", "/t/baseline_overlay", self.META)
         self.assertFalse(got["checked"])
 
+    def test_a_leg_that_cannot_run_degrades_to_unchecked_instead_of_blocking_the_measurement(self):
+        """A task dir vendored before `--mode dispatch` existed makes the leg exit non-zero.
+
+        That is not evidence about dispatch, and `measure_legs` calls this before every measurement:
+        letting the RuntimeError out would turn a gate against wrong baselines into a new way for a
+        correct task to fail to measure at all."""
+        def run_leg(task, overlay, mode, **kw):
+            raise RuntimeError("leg(dispatch) exited 2: invalid choice: 'dispatch'")
+
+        with _patched(hl, _run_leg=run_leg, _kernel_matcher=lambda: (lambda w, g: w == g)):
+            got = hl.assert_baseline_dispatch("/t", "/t/baseline_overlay", self.META)
+        self.assertFalse(got["checked"])
+        self.assertIn("invalid choice", got["why"])
+
     def test_missing_matcher_or_device_kernel_degrades_to_unchecked(self):
         with _patched(hl, _kernel_matcher=lambda: None,
                       _run_leg=lambda *a, **k: self.fail("must not run a leg")):

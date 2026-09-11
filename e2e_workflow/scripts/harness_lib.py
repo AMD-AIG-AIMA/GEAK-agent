@@ -1494,15 +1494,26 @@ def assert_baseline_dispatch(task_dir, base, meta, timeout=600):
 
     Raises ``HarnessIncompleteError`` (UT-GENERATION defect, exit 3 — NOT a candidate-correctness
     failure) rather than returning False, so a mismatch reads as "regenerate the UT", never as
-    "reject the kernel". Skipped with a note when the profile yields no kernel names at all (CPU-only
-    box, profiler unavailable) — absence of evidence must not manufacture a verdict.
+    "reject the kernel". Skipped with a note when the evidence cannot be gathered at all — the profile
+    yields no kernel names (CPU-only box), or the dispatch leg itself does not run (older vendored
+    leg_runner.py without the mode, no torch.profiler). Absence of evidence must not manufacture a
+    verdict in EITHER direction: this gate exists to catch a wrong baseline, not to become a new way
+    for a correct task to fail to measure.
     """
     want = str((meta or {}).get("device_kernel") or "").strip()
     matches = _kernel_matcher()
     if not want or matches is None:
         return {"checked": False, "why": "no device_kernel in meta" if not want
                 else "kernel_selection.py not vendored next to harness_lib.py"}
-    observed = _run_leg(os.path.abspath(task_dir), base, "dispatch", timeout=timeout)
+    try:
+        observed = _run_leg(os.path.abspath(task_dir), base, "dispatch", timeout=timeout)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+        # A leg that will not RUN is not a leg that ran the wrong kernel. Task dirs vendored before
+        # this mode existed reject `--mode dispatch` at argparse, and a box without torch.profiler
+        # raises on import; neither is evidence about dispatch, so degrade instead of blocking a
+        # measurement that is otherwise fine.
+        return {"checked": False, "why": f"dispatch leg did not run: {str(exc)[:300]}",
+                "device_kernel": want}
     per_case = (observed or {}).get("kernels") or {}
     all_names = [n for names in per_case.values() for n in names]
     if not all_names:

@@ -54,6 +54,11 @@ _ATTR_MAX_STR = 200
 # captured server did not have is its own infidelity.
 _ENV_CAPTURE_RE = re.compile(
     r"^(AITER|GEAK|SGLANG|VLLM|TORCH|TORCHINDUCTOR|PYTORCH|TRITON|HIP|ROCM|HSA|CK|GPU)_|FLYDSL")
+# ...minus anything that carries a credential. The prefixes above are broad on purpose, and the
+# capturing process is the SERVER process, which holds the pipeline's own secrets: `GEAK_KB_STORE_TOKEN`
+# matches `^GEAK_`. meta.json travels with the task dir into the KB, so a captured token would be
+# published. The name is kept (it is still dispatch-relevant that the variable was set); the value is not.
+_ENV_REDACT_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CRED|AUTH|COOKIE|SESSION)", re.I)
 
 _STATE = {
     "target": None, "out_dir": None, "max_cases": 5, "num_steps": 0,
@@ -393,11 +398,15 @@ def _env_snapshot():
     Lets a UT that reproduces the wrong kernel be diagnosed from the task dir instead of from server
     logs: an empty ``AITER_CONFIG_FMOE`` here means the captured server ran the heuristic path, so a
     UT that exports a tuned table is measuring a third code path that deployment never took.
+
+    Credential-looking names are recorded with their value replaced by ``"<redacted>"`` (see
+    ``_ENV_REDACT_RE``) — this runs inside the server process and meta.json is published with the task.
     """
     env = {}
     for key in sorted(os.environ):
         if _ENV_CAPTURE_RE.search(key):
-            env[key] = str(os.environ[key])[:_ATTR_MAX_STR]
+            env[key] = ("<redacted>" if _ENV_REDACT_RE.search(key)
+                        else str(os.environ[key])[:_ATTR_MAX_STR])
     return env
 
 
