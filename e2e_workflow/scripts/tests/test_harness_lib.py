@@ -2307,6 +2307,49 @@ class TestRunLeg(_LegTestCase):
         self.assertIn("produced no JSON", str(cm.exception))
 
 
+class TestDeclaredAttrs(_HarnessTestCase):
+    """`meta.live_tensor_attrs` retrofits a dispatch flag onto an oracle captured before `attrs`."""
+
+    def test_a_declared_attribute_lands_on_the_named_kwarg(self):
+        w1, w2 = _T((2, 2)), _T((2, 2))
+        args = {"pos": [], "kw": {"w1": w1, "w2": w2, "doweight_stage1": False}}
+        hl.apply_declared_attrs(args, {"live_tensor_attrs": {"w1": {"is_shuffled": True},
+                                                             "w2": {"is_shuffled": True}}})
+        self.assertTrue(getattr(w1, "is_shuffled", False))
+        self.assertTrue(getattr(w2, "is_shuffled", False))
+
+    def test_a_positional_operand_is_addressable_by_index(self):
+        w = _T((2, 2))
+        args = {"pos": [_T((1,)), w], "kw": {}}
+        hl.apply_declared_attrs(args, {"live_tensor_attrs": {"pos[1]": {"is_shuffled": True}}})
+        self.assertTrue(getattr(w, "is_shuffled", False))
+
+    def test_no_declaration_is_a_no_op(self):
+        args = {"pos": [], "kw": {"w1": _T((2, 2))}}
+        self.assertIs(hl.apply_declared_attrs(args, {}), args)
+        self.assertIs(hl.apply_declared_attrs(args, {"live_tensor_attrs": None}), args)
+
+    def test_a_declaration_that_matches_no_operand_raises_instead_of_silently_doing_nothing(self):
+        """The per-task ancestor of this helper returned early on an empty spec, so a stale operand
+        name read exactly like "nothing to restore" -- and the leg went on measuring the wrong
+        backend. A declaration that does not land is a UT defect, hence HarnessIncompleteError."""
+        args = {"pos": [], "kw": {"w1": _T((2, 2))}}
+        with self.assertRaises(hl.HarnessIncompleteError) as cm:
+            hl.apply_declared_attrs(args, {"live_tensor_attrs": {"w3": {"is_shuffled": True}}})
+        self.assertIn("'w3'", str(cm.exception))
+
+    def test_a_declared_name_bound_to_a_non_tensor_also_raises(self):
+        """`doweight_stage1=False` is a real kwarg of this seam; setattr on a bool would be lost."""
+        args = {"pos": [], "kw": {"doweight_stage1": False}}
+        with self.assertRaises(hl.HarnessIncompleteError):
+            hl.apply_declared_attrs(args, {"live_tensor_attrs": {"doweight_stage1": {"x": 1}}})
+
+    def test_an_out_of_range_positional_index_raises(self):
+        args = {"pos": [_T((1,))], "kw": {}}
+        with self.assertRaises(hl.HarnessIncompleteError):
+            hl.apply_declared_attrs(args, {"live_tensor_attrs": {"pos[7]": {"is_shuffled": True}}})
+
+
 class TestBaselineDispatchGate(_HarnessTestCase):
     """The baseline leg must launch the kernel the task is NAMED after.
 

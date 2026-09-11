@@ -42,6 +42,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -580,6 +581,49 @@ def reconstruct_captured(obj, device="cpu"):
     if isinstance(obj, (list, tuple)):
         return type(obj)(reconstruct_captured(v, device) for v in obj)
     return obj
+
+
+def apply_declared_attrs(args, meta):
+    """Apply ``meta.live_tensor_attrs`` = {operand: {attr: value}} to a rehydrated ``args`` bundle.
+
+    This is the RETROFIT path, for an oracle captured before ``capture_shapes`` recorded per-tensor
+    ``attrs``: the blob carries the loader's preshuffled BYTES with the loader's FLAG stripped, and
+    the flag cannot be recovered from the file. Declaring it in meta.json restores it. A capture that
+    HAS ``attrs`` needs nothing here — ``reconstruct_captured`` already replays it, and this is a
+    no-op unless meta also declares something (an explicit declaration wins, so a hand-written
+    correction can override a bad recording).
+
+    ``args`` is the ``{"pos": [...], "kw": {...}}`` bundle cases.py passes to ``call``. An operand is
+    addressed by kwarg name, or by ``"pos[<i>]"`` for a positional. RAISES on a declaration that
+    matches no operand: this mechanism previously shipped as a per-task helper that returned early on
+    an empty spec, so a typo'd or stale name read exactly like "nothing to restore" and the UT went
+    on quietly measuring the wrong dispatch branch. A declaration that does not land is a defect in
+    the UT, not a condition to tolerate.
+    """
+    spec = (meta or {}).get("live_tensor_attrs") or {}
+    if not spec:
+        return args
+    pos = list(args.get("pos") or ())
+    kw = args.get("kw") or {}
+    missing = []
+    for name, attrs in spec.items():
+        m = re.match(r"^pos\[(\d+)\]$", str(name))
+        if m:
+            i = int(m.group(1))
+            target = pos[i] if i < len(pos) else None
+        else:
+            target = kw.get(name)
+        if target is None or not hasattr(target, "shape"):
+            missing.append(name)
+            continue
+        apply_captured_attrs(target, attrs)
+    if missing:
+        raise HarnessIncompleteError(
+            "meta.live_tensor_attrs declares %s, which %s not a tensor operand of this call. The "
+            "declaration exists to restore a dispatch-steering attribute the capture dropped; a name "
+            "that does not land restores nothing and the leg silently runs the wrong backend."
+            % (", ".join(repr(x) for x in missing), "is" if len(missing) == 1 else "are"))
+    return args
 
 
 def load_reference_io(path, map_location="cpu"):
@@ -1470,10 +1514,13 @@ def assert_baseline_dispatch(task_dir, base, meta, timeout=600):
             f"{sorted(set(all_names))[:8]}. The task is named after one kernel and measures another, "
             "so its speedup is a DISPATCH FLIP, not an optimization. Usual causes, in order: (1) the "
             "oracle lost a loader-set weight attribute that gates the backend (capture_shapes records "
-            "these under 'attrs'; an oracle frozen before that must be recaptured), (2) meta.capture_env "
-            "differs from this process's env, (3) meta.device_kernel names a kernel the selected seam "
-            "does not reach. Recapture or re-select the seam — do NOT 'fix' this by exporting a tuned "
-            "config the captured server did not have, which is a THIRD code path.")
+            "these under 'attrs'; an oracle frozen before that carries none, and is repaired either by "
+            "recapturing or — when the attribute and its deployment value are known — by declaring it "
+            "in meta.live_tensor_attrs and applying it with apply_declared_attrs after rehydration), "
+            "(2) meta.capture_env differs from this process's env, (3) meta.device_kernel names a "
+            "kernel the selected seam does not reach. Recapture or re-select the seam — do NOT 'fix' "
+            "this by exporting a tuned config the captured server did not have, which is a THIRD code "
+            "path.")
         print(f"{UT_HARNESS_INCOMPLETE_SENTINEL}: {reason}")
         raise HarnessIncompleteError(reason)
     return {"checked": True, "device_kernel": want, "matched_cases": sorted(hit),

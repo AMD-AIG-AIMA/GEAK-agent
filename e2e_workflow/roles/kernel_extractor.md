@@ -52,6 +52,15 @@ and the golden, frozen from that same wrong baseline, agrees with itself. `h.rec
 after the device move. If a task genuinely needs an extra step (e.g. a uint8 raw view for a packed
 fp4 operand), wrap `h.reconstruct_captured` — do not replace it.
 
+If the rehydration genuinely cannot preserve the attribute — the operand is rebuilt by `.view(dt)` or
+`.set_()`, both of which return a fresh tensor — declare it in `meta.live_tensor_attrs`
+(`{operand: {attr: value}}`, `"pos[<i>]"` for a positional) and call `h.apply_declared_attrs(args, META)`
+ONCE, at the single point every case set draws its operands from, AFTER rehydration. Same rule for an
+oracle captured before `attrs` existed: the flag is not in the file and cannot be recovered from it, so
+declaring the deployment value is the only repair short of recapturing. Record WHY the declared value is
+deployment's (a server.log line, a profile) — it is an assertion about a run that already happened, and
+`assert_baseline_dispatch` only proves the result reaches the right kernel, not that the value is right.
+
 ### 🔴 THE TWO LEGS ARE THE SAME CODE UNDER TWO PYTHONPATHS — read this before writing anything
 There is no `baseline_callable`, and no second copy of the source to time against. Both legs run the
 SAME `leg_runner.py` + the SAME `cases.py`; the only difference is the overlay on PYTHONPATH:
