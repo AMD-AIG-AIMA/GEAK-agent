@@ -1540,6 +1540,76 @@ async function extractWithBaseline(role, phase, intro, inputs, opts) {
   return ext;
 }
 
+// ── DISK RECOVERY for a kernel_workflow lane whose RETURN was lost ────────────────────────────
+// The nested kernel_workflow writes its arbitrated result to disk — `exp_root/team_<op>_<ts>_*/<op>/`
+// with `final_patch.diff` + `director_validation.json` — BEFORE that value travels back to us. So a
+// transport-level loss (the burst threw, timed out, or resolved null) does NOT mean the lane produced
+// nothing, and re-running it from scratch throws a finished team away.
+//
+// fixv5 (2026-09-10, DeepSeek-V4) is the case this exists for. team1 finished at 19:14 with a
+// Director-arbitrated weighted 3.4199x / 3.4111x over two independent full unittest runs, correctness
+// pass on every leg, validation_status "accepted". Its return was lost, `transient` read true, a SECOND
+// team started from baseline at 19:16, and the run's deadline arrived 1h54m later with neither the owed
+// e2e A/B nor the new team finished — so a real 3.42x head kernel shipped as `accepted_kernels: []`.
+//
+// Admission follows the Director's own contract (kernel_workflow/roles/director.md): a merit-`accepted`
+// lane is eligible to win the bake-off and MUST be carried to the e2e bench even when
+// `timing_provenance_ok` is false — the e2e A/B IS the confirmation that unproven provenance owes. We
+// therefore do NOT filter on timing provenance; we propagate `requires_e2e_confirmation` so the caller
+// can see why the lane has to be integrated rather than curated. A Director `rejected` lane is left
+// where it is: that verdict is on merit, and recovery must not launder it.
+//
+// Scoped by a BEFORE-snapshot of the team dirs so a recovery can only ever pick up a team THIS call
+// created — never another language's lane running under the same exp_root.
+const _teamDirs = (expRoot, opName) => {
+  try {
+    const fs = require('fs'), path = require('path');
+    if (!expRoot || !opName) return [];
+    return fs.readdirSync(expRoot)
+      .filter((n) => n.startsWith(`team_${opName}_`))
+      .map((n) => path.join(expRoot, n));
+  } catch (e) { return []; }
+};
+const teamSnapshot = (expRoot, opName) => new Set(_teamDirs(expRoot, opName));
+const opNameOf = (taskDir) => String(taskDir || '').split('/').filter(Boolean).pop() || '';
+const recoverLaneFromDisk = (expRoot, opName, before) => {
+  let best = null;
+  let fs, path;
+  try { fs = require('fs'); path = require('path'); } catch (e) { return null; }
+  for (const td of _teamDirs(expRoot, opName)) {
+    if (before && before.has(td)) continue;                 // only teams this call created
+    const evalDir = path.join(td, opName);
+    const patch = path.join(evalDir, 'final_patch.diff');
+    let st; try { st = fs.statSync(patch); } catch (e) { continue; }
+    if (!st.size) continue;                                  // an empty diff is not a result
+    let dv = {};
+    try { dv = JSON.parse(fs.readFileSync(path.join(evalDir, 'director_validation.json'), 'utf8')); }
+    catch (e) { dv = {}; }
+    if (dv.validation_status === 'rejected') continue;        // Director threw it out on merit
+    const w = Number(dv.director_verified_speedup_weighted);
+    const g = Number(dv.director_verified_speedup_geomean);
+    const cand = {
+      authored: true, recovered_from_disk: true, ran: true,
+      eval_dir: evalDir, final_patch: patch,
+      ...(Number.isFinite(w) && w > 0 ? { final_weighted: w } : {}),
+      ...(Number.isFinite(g) && g > 0 ? { final_geomean: g } : {}),
+      validation_status: dv.validation_status || 'recovered_from_disk',
+      correctness: dv.correctness || '',
+      // Unproven provenance is exactly what the e2e A/B settles — carry it, don't drop it.
+      requires_e2e_confirmation: dv.requires_e2e_confirmation !== false,
+      timing_provenance_ok: dv.timing_provenance_ok === true,
+      reason: 'recovered from disk after a lost kernel_workflow return',
+      _mtime: st.mtimeMs,
+    };
+    // Without a Director number there is no speedup to claim; recovering the patch alone would
+    // fabricate one. Leave it to the normal no-usable-kernel path.
+    if (cand.final_weighted == null && cand.final_geomean == null) continue;
+    if (!best || cand._mtime > best._mtime) best = cand;
+  }
+  return best;
+};
+const recoveredIso = (rec) => (rec && (rec.final_weighted != null ? rec.final_weighted : rec.final_geomean)) || 0;
+
 // abDone == the integrator measured BOTH legs (ref + cand) and emitted a real
 // verdict. gate:'incomplete' or ab_complete:false means a leg is still missing.
 const abDone = (integ) => !!(integ && integ.gate !== 'incomplete' && integ.ab_complete !== false);
@@ -3743,6 +3813,8 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
       if (FAST_DEADLINE_HIT) return null;
       return ISO.with(1, async (g) => {
         const lang = j.ap.language || 'triton';
+        const jExpRoot = `${EVAL_DIR}/kernels/_exp`, jOp = opNameOf(j.ext.task_dir);
+        const jTeamsBefore = teamSnapshot(jExpRoot, jOp);
         let al;
         try {
           al = await fastBoundedWorkflow({ scriptPath: KERNEL_WF_SCRIPT }, {
@@ -3763,6 +3835,16 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
             apply_to_original: 'false',
           }, `${j.short_name}:${lang}`);
         } catch (e) { al = { authored: false, validation_status: 'error', reason: String(e) }; }
+        // Fan-out has no retry, so a lost return here drops the language outright. Recover the
+        // finished team from disk first (same contract as the serial path).
+        if (!al || al.validation_status === 'error' || (al.authored === false && al.final_geomean == null)) {
+          const rec = recoverLaneFromDisk(jExpRoot, jOp, jTeamsBefore);
+          if (rec) {
+            log(`  ${j.short_name}: author ${lang} return lost (${al ? al.reason || al.validation_status : 'null'}) — ` +
+              `RECOVERED a finished team from disk: ${rec.eval_dir} (${recoveredIso(rec).toFixed(2)}x weighted, ${rec.validation_status}).`);
+            al = rec;
+          }
+        }
         return { j, al };
       });
     }));
@@ -3954,6 +4036,8 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
       // language (it dropped FlyDSL in the 2026-06-12 run). Do NOT retry a COMPLETED no-speedup
       // (final_geomean present but <=1.0) — that's a real result, retrying just wastes budget.
       const AUTHOR_TRIES = parseInt(A.head_author_tries != null ? A.head_author_tries : (FAST_MODE ? 1 : 2), 10);
+      const hExpRoot = `${EVAL_DIR}/kernels/_exp`, hOp = opNameOf(ext.task_dir);
+      const teamsBefore = teamSnapshot(hExpRoot, hOp);
       for (let attempt = 1; attempt <= AUTHOR_TRIES; attempt++) {
         try {
           al = await fastBoundedWorkflow({ scriptPath: KERNEL_WF_SCRIPT }, {
@@ -3978,7 +4062,18 @@ if (want('head') && headQueue.length && HEAD_BUDGET > 0) {
             apply_to_original: 'false',
           }, `${h.short_name}:${lang}`);
         } catch (e) { al = { authored: false, validation_status: 'error', reason: String(e) }; }
-        const transient = !al || al.validation_status === 'error' || (al.authored === false && al.final_geomean == null);
+        let transient = !al || al.validation_status === 'error' || (al.authored === false && al.final_geomean == null);
+        // The RETURN was lost, not necessarily the work. Before burning a whole second team on the
+        // same op, look for a team this call already finished on disk (see recoverLaneFromDisk).
+        if (transient) {
+          const rec = recoverLaneFromDisk(hExpRoot, hOp, teamsBefore);
+          if (rec) {
+            log(`  ${h.short_name}: author ${lang} return lost (${al ? al.reason || al.validation_status : 'null'}) but a FINISHED team is on disk — ` +
+              `RECOVERED ${rec.eval_dir} (${recoveredIso(rec).toFixed(2)}x weighted, ${rec.validation_status}` +
+              `${rec.requires_e2e_confirmation ? ', requires_e2e_confirmation → goes straight to the e2e gate' : ''}); admitting it instead of re-running a team.`);
+            al = rec; transient = false;
+          }
+        }
         if (!transient || attempt === AUTHOR_TRIES) break;
         log(`  ${h.short_name}: author ${lang} attempt ${attempt}/${AUTHOR_TRIES} died transiently (${al ? al.reason || al.validation_status : 'null'}) — retrying so this language isn't dropped.`);
       }
@@ -4220,6 +4315,8 @@ while (want('kernel') && !TIME_DEADLINE_HIT && dispatched < BUDGET && (dispatche
       return { c, skip: true, reason: `extraction failed/non-editable (${ext ? ext.notes || ext.unittest_smoke : 'none'})` };
     }
     // RECURSIVE kernel layer on the IMMUTABLE task dir (one allowed nesting level via workflow()).
+    const kExpRoot = `${EVAL_DIR}/kernels/_exp`, kOp = opNameOf(ext.task_dir);
+    const kTeamsBefore = teamSnapshot(kExpRoot, kOp);
     let kl;
     try {
       const r = await workflow({ scriptPath: KERNEL_WF_SCRIPT }, laneArgs({
@@ -4237,6 +4334,17 @@ while (want('kernel') && !TIME_DEADLINE_HIT && dispatched < BUDGET && (dispatche
         note: (r.winner && r.winner.source) || '' };
     } catch (e) {
       kl = { ran: false, final_patch: '', final_geomean: 0, validation_status: 'error', note: String(e) };
+    }
+    if (!kl || !kl.ran || !kl.final_patch || !(kl.final_geomean > 0)) {
+      const rec = recoverLaneFromDisk(kExpRoot, kOp, kTeamsBefore);
+      if (rec) {
+        log(`  ${c.short_name}: kernel-layer return lost (${kl ? kl.note || kl.validation_status : 'null'}) — ` +
+          `RECOVERED a finished team from disk: ${rec.eval_dir} (${recoveredIso(rec).toFixed(2)}x).`);
+        kl = { ran: true, kernel_eval_dir: rec.eval_dir, final_patch: rec.final_patch,
+          final_geomean: recoveredIso(rec), validation_status: rec.validation_status,
+          requires_e2e_confirmation: rec.requires_e2e_confirmation, recovered_from_disk: true,
+          note: rec.reason };
+      }
     }
     return { c, ext, kl };
   }));
