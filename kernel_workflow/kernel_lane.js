@@ -216,9 +216,8 @@ const FROZEN_ORACLE = String(A.frozen_oracle != null ? A.frozen_oracle : 'false'
 
 // ---------------------------------------------------------------------------
 // WARM-START (the experience KB). Before the optimize loop, search the machine-produced KB —
-// addressed by canonical id on both planes — for the top-3 best patches for THIS
-// (kernel, language, gfx), validate
-// each through the SAME verify_engineer gate, and adopt the first that passes; after Validate,
+// addressed by canonical id on both planes — for the top-3 best patches for THIS (kernel, language,
+// gfx), validate each through the SAME verify_engineer gate, and adopt the first that passes; after
 // write this run's own win back.
 //   on (default)      | read + validate top-3, ADOPT the first that passes.
 //   reference         | read top-3 as prose only, never auto-apply.
@@ -246,16 +245,11 @@ const WARM_START_MATCH = ['exact', 'normalized', 'fuzzy'].includes(String(A.warm
 //   local            the kb_artifacts/ tree, keyed by slug. The original scheme, kept as an escape
 //                    hatch for a box whose store is unusable.
 //
-// `store` is the default because it is the SAME addressing the service uses, and running two
-// schemes side by side cost more than it bought: `resolve` and `resolve-remote` assembled their
-// filter chains separately and drifted, which is how the keyed read ended up without the
-// `--include-retired` the slug read has had since it existed. One address, two planes.
-//
-// Nothing is lost by the switch, because nothing is moved: the tree is still written (see
-// `write-remote --plane both` below, which has been the default write for a while — the store
-// already holds every measurement since), and `sync-local` carries the BACKLOG across before each
-// read. What the tree keeps is its job as the assembly buffer the remote payload is derived from,
-// and as the surface a curation pass edits by hand.
+// `store` is the default because it is the SAME addressing the service uses. Two schemes side by
+// side drifted — `resolve` and `resolve-remote` assembled their filter chains separately, which is
+// how the keyed read lost the `--include-retired` the slug read always had. Nothing moves: the tree
+// is still written (`write-remote --plane both`) and `sync-local` carries the backlog across before
+// each read; the tree stays the assembly buffer and the surface a curation pass edits.
 const KB_MODE = String(A.kb_mode || 'store').trim().toLowerCase() === 'local' ? 'local' : 'store';
 const KB_STORE_DIR = String(A.kb_store_dir ||
   (KB_ARTIFACTS_DIR ? KB_ARTIFACTS_DIR.replace(/\/[^/]*$/, '') + '/kb_store_local' : '')).replace(/\/+$/, '');
@@ -579,18 +573,16 @@ const WARMSTART_RESOLVE_SCHEMA = obj({
   // store mode only: the key the candidates came from. Declared rather than left to
   // additionalProperties so the agent relaying this JSON has no reason to drop it.
   canonical_id: { type: 'string' },
-  // Which of the keyed read's own planes answered ("remote" | "local"). Since both the service and
-  // the on-disk store are addressed by canonical id, this is the ONLY field that tells them apart
-  // — and the attest step below picks its plane flags from it. Dropped, every answer reads as disk.
+  // Which of the keyed read's planes answered ("remote" | "local"). Both are addressed by canonical
+  // id, so this is the ONLY field telling them apart — and the attest step picks its flags from it.
   read_plane: { type: 'string' },
   // Same kernel, another language: the wrong target_language was passed, not an empty store.
   other_language_pages: { type: 'array', items: { type: 'string' } },
   filtered: obj({
     total: { type: 'number' }, retired: { type: 'number' }, below_min_speedup: { type: 'number' },
     same_direction_collapsed: { type: 'number' }, demoted_by_hint: { type: 'number' },
-    // The caveat on every number above: the service ignores the limit and pages `--scan` rows, so
-    // a saturated read describes a prefix of the page. Declared or the relaying agent drops it,
-    // and a thin answer off a truncated page reads identically to a thin page.
+    // The caveat on every number above: the service pages `--scan` rows, so a saturated read
+    // describes a prefix of the page and reads identically to a thin page.
     scanned: { type: 'number' }, scan_saturated: { type: 'boolean' },
   }),
   candidates: {
@@ -598,8 +590,8 @@ const WARMSTART_RESOLVE_SCHEMA = obj({
     items: obj({
       rank: { type: 'number' }, slug: { type: 'string' }, speedup: { type: 'number' },
       exp_dir: { type: 'string' }, arch: { type: 'string' },
-      // Declared for the same reason canonical_id is: without it the relaying agent drops it, and
-      // the attest step below has no address to write this run's verdict back to.
+      // Declared for the same reason canonical_id is: without it the attest step below has no
+      // address to write this run's verdict back to.
       session_id: { type: 'string' },
       patch_path: { type: 'string' }, prose_path: { type: 'string' },
       strategy: { type: 'string' }, status: { type: 'string' },
@@ -1010,10 +1002,9 @@ if (setup.resumed && setup.prior_state) {
 // ===========================================================================
 const GFX = (String((profileSummary && profileSummary.device) || '').match(/gfx\d+/i) || [''])[0].toLowerCase();
 // One benched candidate -> one of kb/attest.py's four outcomes. `inapplicable` is a verdict on the
-// PAIRING and is excluded from the retire arithmetic, so it is where both "this workspace does not
-// have those files" and "it did win but we could not commit it here" belong — neither is evidence
-// against the record. A patch that ran and gave a WRONG ANSWER is `failed`: it applied, it ran, and
-// it did not deliver what the record promised.
+// PAIRING, excluded from the retire arithmetic — both "this workspace lacks those files" and "it
+// won but could not be committed here" belong there. A patch that ran and gave a WRONG ANSWER is
+// `failed`: it applied, it ran, and it did not deliver what the record promised.
 const kbVerdict = (ver, sp) => {
   if (!ver) return 'not_reproduced';
   if (says(ver.correctness, 'fail')) return 'failed';
@@ -1038,22 +1029,16 @@ if (WARM_START_ON && !setup.resumed && KB_ROOT_OK) {
       ? `resolve-remote --plane local --store ${JSON.stringify(KB_STORE_DIR)}${KB_VERSION_FLAG}`
       : `resolve --root ${JSON.stringify(KB_ARTIFACTS_DIR)} --match ${WARM_START_MATCH}`;
     // Bring the local store level with the tree before reading it, scoped to this kernel and arch
-    // so it costs a stat walk over one page and not the whole KB. Writes have filed BOTH schemes
-    // for a while, so on a busy box this is a no-op; what it catches is the backlog — entries older
-    // than that default, and anything a curation pass imported into the tree by hand. Without it,
-    // reading by key would look like a cold start on exactly the kernels with the longest history.
+    // so it costs a stat walk over one page. Writes file both schemes, so this is usually a no-op;
+    // what it catches is the backlog and anything a curation pass imported by hand — without it,
+    // reading by key looks like a cold start on the kernels with the longest history. Idempotent
+    // and non-destructive (cmd_sync_local): the session id is a digest of the patch, and the write
+    // carries the store's ledger, retraction and reproduction count forward.
     //
-    // Idempotent and non-destructive by construction (see cmd_sync_local): the session id is a
-    // digest of the patch, and the write carries the store's own ledger, retraction and
-    // reproduction count forward. So it is safe to run on every read, and running it on every read
-    // is what keeps the two schemes from silently diverging again.
-    //
-    // `|| true`: the read below prints the JSON this phase returns, and a sync that cannot run must
-    // degrade to a thinner page, never to a failed warm start. Its summary goes to a file rather
-    // than to /dev/null, because the failures it reports are otherwise indistinguishable from an
-    // empty KB — `skipped.unreadable` in particular, which is what a tree written by a root
-    // container and read by anyone else looks like. This process has no filesystem access, so the
-    // file is for the human reading the run afterwards; stderr rides along for the same reason.
+    // `|| true`: a sync that cannot run must degrade to a thinner page, never a failed warm start.
+    // Its summary goes to a file rather than /dev/null because its failures are otherwise
+    // indistinguishable from an empty KB — `skipped.unreadable` above all, which is what a tree
+    // written by a root container looks like to everyone else.
     const syncCmd = KB_MODE === 'store' && KB_ARTIFACTS_DIR
       ? `python3 ${JSON.stringify(EXPERIENCE_STORE)} sync-local --root ${JSON.stringify(KB_ARTIFACTS_DIR)} \\
   --store ${JSON.stringify(KB_STORE_DIR)} --kernel-name ${JSON.stringify(KERNEL_NAME)} --gfx ${GFX} \\
@@ -1077,12 +1062,9 @@ if (WARM_START_ON && !setup.resumed && KB_ROOT_OK) {
     // candidates" — not "no error" — is what triggers the second read. Both reads are seconds and
     // no GPU; the thing they protect against is a cold start that costs hours.
     //
-    // The e2e lane spelled out the same branch and no longer does: `read_planes` moved it into
-    // cmd_resolve, so `--plane both` now tries the service and falls back to the mirror by itself.
-    // This one stays in bash, because the fallback here is a DIFFERENT SUBCOMMAND — off the store
-    // scheme, `localResolveCmd` is `resolve --root kb_artifacts --match`, reading the curated tree
-    // rather than a second plane of the same store. There is no plane list that expresses that, and
-    // faking one would mean teaching resolve-remote to read a directory layout it does not own.
+    // The e2e lane pushed this branch into cmd_resolve via `read_planes`; this one stays in bash
+    // because its fallback is a DIFFERENT SUBCOMMAND — off the store scheme `localResolveCmd` reads
+    // the curated tree, not a second plane of the same store, and no plane list expresses that.
     const resolveScript = KB_REMOTE === 'off'
       ? `${syncCmd}python3 ${JSON.stringify(EXPERIENCE_STORE)} ${localResolveCmd} \\\n  ${commonArgs}`
       : `${syncCmd}${KB_ENV_PRELUDE}
@@ -1101,8 +1083,8 @@ python3 ${JSON.stringify(EXPERIENCE_STORE)} ${localResolveCmd} \\
       `${KB_REMOTE === 'off' && !syncCmd ? 'command' : 'script'} ` +
       `and return its single-line JSON stdout verbatim as StructuredOutput — do not add, drop, reorder, ` +
       `or reinterpret any field. ` +
-      // The sync line prints nothing and its result is not the answer; saying so keeps the agent
-      // from relaying its summary, or from treating its `|| true` as an error worth retrying.
+      // Saying the sync line is not the answer keeps the agent from relaying its summary, or from
+      // treating its `|| true` as an error worth retrying.
       (syncCmd ? `Its first line brings the on-disk knowledge base up to date and prints nothing ` +
         `(its summary is redirected to a file); the JSON you return is the LAST command's. ` : '') +
       (KB_REMOTE === 'off' ? '' :
@@ -1124,17 +1106,11 @@ ${resolveScript}
       session_id: c.session_id || '', exp_dir: c.exp_dir || '',
     }));
     const f = resolved.filtered || {};
-    // Which plane actually answered — read off the answer, not inferred from the mode. Both
-    // key-addressed reads emit `canonical_id`, so on the default `store` mode its presence no
-    // longer separates the service from the disk; `read_plane` is the subcommand saying which of
-    // its own planes spoke (kb/plane.py:read_planes), and only `resolve` — the slug read — emits
-    // neither. Getting this wrong is not cosmetic: it picks the flags the attest step writes this
-    // run's verdict back with, so a service answer credited to the disk would file the ledger on
-    // the wrong plane. Worth logging either way, since on a scheme with no search a thin answer and
-    // a mis-keyed question look identical from the outside.
-    // No canonical id at all means neither keyed read answered. On the default `store` mode that is
-    // an empty page (`none`), not a slug-tree read — the tree is only consulted under
-    // `--kb_mode local`, which is the one case that still reports `local`.
+    // Which plane answered — read off the answer, not inferred from the mode. Both keyed reads
+    // emit `canonical_id`, so only `read_plane` (kb/plane.py:read_planes) separates service from
+    // disk. Not cosmetic: it picks the flags the attest step files this run's verdict with. No
+    // canonical id means neither keyed read answered — on `store` mode that is an empty page
+    // (`none`), since the tree is only consulted under `--kb_mode local`.
     warm_start.plane = resolved.read_plane === 'remote' ? 'remote'
       : resolved.canonical_id ? 'store'
         : KB_MODE === 'store' ? 'none' : 'local';
@@ -1146,8 +1122,8 @@ ${resolveScript}
       `candidates=${cands.length}${f.total ? ` of ${f.total} recorded [${f.retired || 0} retired, ` +
       `${f.below_min_speedup || 0} below ${WARM_START_MIN_SPEEDUP}x, ` +
       `${f.same_direction_collapsed || 0} same-direction]` : ''}` +
-      // Said out loud rather than left in the trace: every count on this line is a count over the
-      // rows that were fetched, and a saturated scan means the page held more than that.
+      // Every count on this line is over the rows FETCHED; a saturated scan means the page held
+      // more.
       `${f.scan_saturated ? ` (SCAN SATURATED at ${f.scanned} — the page holds more)` : ''}`);
     const otherLangs = Array.isArray(resolved.other_language_pages) ? resolved.other_language_pages : [];
     if (!cands.length && otherLangs.length) {   // wrong target_language, not an empty store
@@ -1240,9 +1216,8 @@ correctness check; only report committed=true if it still passes. Return JSON {c
         log(`[kb] warm-start candidate c${c.rank} ${rec ? rec.status : 'rejected'} (${sp ? sp.toFixed(2) + 'x' : 'no measure'}).`);
       }
       // Record what THIS box saw, so the next one reads a ledger and not just a speedup. Only
-      // candidates carrying an `outcome` were actually put on the GPU — the loop breaks after
-      // adopting, and counting a record that was never benched would enter an attempt that never
-      // happened. Non-fatal by construction: the run's own result does not depend on the counter.
+      // candidates carrying an `outcome` reached the GPU — the loop breaks after adopting, and
+      // counting an unbenched record would enter an attempt that never happened.
       const benched = warm_start.candidates.filter(x => x.outcome && (x.session_id || x.exp_dir));
       if (benched.length) {
         const planeFlags = warm_start.plane === 'remote' ? '--plane remote'

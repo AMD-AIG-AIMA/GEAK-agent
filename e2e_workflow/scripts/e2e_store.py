@@ -81,11 +81,9 @@ SPEEDUP_METRIC = "speedup"                  # champion metric on every coarser r
 DEFAULT_TOP_N = 3
 DEFAULT_SCAN = 25
 # How many same-direction runners-up ride along with each offered record. The collapse keeps one
-# entry per `direction:` so that three offers are three IDEAS rather than three spellings of one,
-# but the ones it drops are not noise: they are the same idea measured at other settings, and a
-# reader that wants to re-bench a direction wants the settings that were already tried. Bounded
-# because a page can hold dozens of re-runs of one direction and a prompt cannot; each alternate
-# is a thin summary — no config, no artifacts — so the cost is a few lines, not a bundle.
+# entry per `direction:` so three offers are three IDEAS, but the ones it drops are the same idea at
+# other settings, which is what a reader re-benching a direction wants. Bounded because a page can
+# hold dozens of re-runs and a prompt cannot; each alternate is a thin summary, not a bundle.
 ALTERNATES_LIMIT = 3
 # What `resolve` orders a page by, by name on the CLI. See the module docstring for why a read and
 # a write do not agree on this.
@@ -252,11 +250,9 @@ def cmd_resolve(a) -> dict:
     # it is what lands in identity_out and names the page in the output.
     ladder = ladder_of(a) + legacy_version_ladder(a)
     metric = read_metric(a)
-    # Echo the plane back, both halves of it. `plane` is what the caller ASKED for and `read_plane`
-    # is which one actually answered, and on `both` those differ — the ladder, the ranking and the
-    # shapes are identical whichever spoke, and "where did this candidate come from" is the first
-    # question asked when one turns out to be wrong. `dict(out, ...)` carries them onto every return
-    # path below.
+    # Echo both halves of the plane: `plane` is what the caller ASKED for, `read_plane` which one
+    # answered. On `both` those differ, and "where did this candidate come from" is the first
+    # question asked when one turns out wrong. `dict(out, ...)` carries them onto every return.
     out = {"tried": [c for c, _t, _m, _f in ladder], "canonical_id": ladder[0][0],
            "match_tier": "", "ranked_by": "", "sorted_by": metric, "champion_metric": "",
            "candidates": [], "read_reason": "",
@@ -296,11 +292,9 @@ def cmd_resolve(a) -> dict:
             pass
     planes, plane_why = read_planes(a, metric)
     last_why = plane_why
-    # Planes OUTSIDE the ladder, not inside it. A `both` read that finds nothing on the service has
-    # to re-descend the WHOLE ladder on the mirror; stopping at the first rung either plane happens
-    # to hold would let a coarse remote page shadow an exact local one. The rung's own floor opens
-    # nothing here either — it gates a promotion, and a read never performs one — so the store is
-    # opened once per plane rather than once per rung.
+    # Planes OUTSIDE the ladder: a `both` read re-descends the WHOLE ladder on the mirror, so a
+    # coarse remote page cannot shadow an exact local one. The rung's floor gates a promotion, which
+    # a read never performs, so the store is opened once per plane rather than once per rung.
     for store, read_plane in planes:
         for cid, tier, champion_metric, _floor in ladder:
             try:
@@ -308,50 +302,40 @@ def cmd_resolve(a) -> dict:
             except Exception as e:
                 last_why = "read_failed: %s: %s" % (type(e).__name__, str(e)[:120])
                 continue
-            # Retracted records are dropped BEFORE anything else looks at them, and before the
-            # direction collapse in particular: a retracted entry that happens to rank first for its
-            # direction would otherwise evict the surviving alternatives for that same direction, so a
-            # single false record could hide every good one behind it. Done client-side because it has
-            # to be — retraction zeroes the ranking scalar and re-points the champion, but the service
-            # still serves the session, and nothing in the scheme lets us ask it not to.
+            # Dropped BEFORE the direction collapse in particular: a retracted entry ranking first
+            # for its direction would evict the survivors behind it, so one false record could hide
+            # every good one. Client-side because it has to be — the service still serves the
+            # session, and nothing in the scheme lets us ask it not to.
             kept = [c for c in found if not is_retired(c.value)]
             curation = {"scanned": len(found), "retired": len(found) - len(kept),
                         "sorted_by": metric,
-                        # A saturated scan means the page held MORE than was hydrated, and everything
-                        # below is curating a prefix. Retracted records sink on their own (retraction
-                        # zeroes the ranking scalars), but a demoted one keeps its inflated scalar and
-                        # so keeps its slot in the window — enough of those and a good record never
-                        # gets looked at. Reported rather than paged around: widening the window costs
-                        # one document fetch per record, which on the remote plane is one HTTP GET.
+                        # A saturated scan means everything below is curating a PREFIX. Retracted
+                        # records sink on their own, but a demoted one keeps its inflated scalar and
+                        # its slot — enough of those and a good record is never looked at. Reported
+                        # rather than paged around: widening the window costs a fetch per record.
                         "scan_limit": max(1, int(a.scan)),
                         "scan_saturated": len(found) >= max(1, int(a.scan))}
-            # Re-sorted here even though the store already ordered by this metric, because the two
-            # planes order by slightly different things: the local one ranks on the document scalar,
-            # the remote one on the score the service computed and falls back to the document only
-            # when that is absent. Sorting the hydrated views is the one place both planes are
-            # guaranteed to agree, and collapse_by_direction's contract is that its input is already
-            # in rank order — it keeps the FIRST entry per direction, so a wrong order here silently
-            # offers the wrong member of every group.
+            # Re-sorted even though the store ordered by this metric, because the planes order by
+            # slightly different things (document scalar vs the service's score). The hydrated views
+            # are the one place both agree, and collapse_by_direction keeps the FIRST entry per
+            # direction — a wrong order here silently offers the wrong member of every group.
             ordered = demote_hinted(sorted([_view(c, cid, tier, metric, champion_metric) for c in kept],
                                            key=_sort_key(metric)),
                                     lambda v: v.get("retire_hint"))
-            # Reported, because a demotion is invisible in the output otherwise: the record is still
-            # listed, still carries its real numbers, and simply appears lower than the scalars alone
-            # would put it. "Why is the 1.30x record behind the 1.04x one" has to be answerable without
-            # re-deriving the sort key by hand.
+            # Reported, because a demotion is otherwise invisible: the record is still listed with
+            # its real numbers, just lower than the scalars alone would put it.
             curation["demoted_by_hint"] = sum(1 for v in ordered if v.get("retire_hint"))
             if a.min_speedup:
-                # Applied to `speedup` on every rung, including the throughput-ranked one: the floor
-                # asks "did this run actually improve anything", which is a question about the ratio no
-                # matter what the page is sorted by. A record with no speedup recorded is kept — it may
-                # still be a usable config — rather than silently failing an unanswerable test.
+                # Applied to `speedup` on every rung, including the throughput-ranked one: the
+                # floor asks "did this improve anything", a question about the ratio whatever the
+                # page is sorted by. A record with no speedup is kept rather than failed on an
+                # unanswerable test.
                 #
-                # BEFORE the collapse, not after, and this ordering is the whole point: the collapse
-                # keeps one entry per direction, so a group whose best record is below the floor used
-                # to offer NOTHING for that direction even when a runner-up in the same group cleared
-                # it — the runner-up had already been collapsed away by the record that was then
-                # filtered out. Filtering first means a record that cannot be offered cannot hold a
-                # direction slot hostage either. The kernel lane has always gated in this order.
+                # BEFORE the collapse, and that ordering is the point: the collapse keeps one entry
+                # per direction, so a group whose best record is below the floor used to offer
+                # NOTHING even when a runner-up cleared it. Filtering first means a record that
+                # cannot be offered cannot hold a direction slot hostage. The kernel lane has always
+                # gated in this order.
                 before = len(ordered)
                 ordered = [v for v in ordered
                            if v["speedup"] is None or v["speedup"] >= float(a.min_speedup)]
@@ -363,32 +347,24 @@ def cmd_resolve(a) -> dict:
                 ordered, lambda v: v["direction"], lambda v: v["session_id"], len(ordered))
             curation["same_direction_collapsed"] = collapsed
             if not views:
-                # A rung whose every candidate was curated away is NOT an empty page, and the next rung
-                # down is about to be tried as if it were. Carry the counts forward so the caller can
-                # tell "nobody has recorded this" from "everything recorded here was retracted" —
-                # identical read_reasons otherwise, opposite meanings.
+                # A rung whose every candidate was curated away is NOT an empty page, yet the next
+                # rung is about to be tried as if it were. Carry the counts forward so the caller
+                # can tell "nobody recorded this" from "everything recorded here was retracted".
                 #
-                # Only an EMPTY rung descends. A rung holding nothing but demoted records answers and
-                # stops here, deliberately: a demotion is advisory, the record is still offered with
-                # its numbers and its hint, and an exact-workload record that has lost twice is still
-                # better evidence about THIS deployment than a coarse-rung record measured somewhere
-                # else. `demoted_by_hint == scanned` in the curation block is how a reader sees it.
+                # Only an EMPTY rung descends. A rung of nothing but demoted records answers and
+                # stops: a demotion is advisory, and an exact-workload record that lost twice is
+                # still better evidence about THIS deployment than a coarse rung measured elsewhere.
                 #
-                # FIRST rung that saw records wins the slot, not the last one to write it. The loop
-                # keeps descending — and on `both` keeps going to the mirror — and every empty rung
-                # after this one carries `scanned: 0`, so a plain assignment would hand the caller the
-                # emptiest page of the several that were read and bury the one that had something on
-                # it. On 20260907 that was the whole finding: the service's exact rung held one
-                # record that the floor filtered, and what came back described a page nobody had ever
-                # written to.
+                # FIRST rung that saw records wins the slot. Every empty rung after it carries
+                # `scanned: 0`, so a plain assignment would hand the caller the emptiest page read
+                # and bury the one that had something on it.
                 if not (out.get("curation") or {}).get("scanned"):
                     out["curation"] = dict(curation, canonical_id=cid, tier=tier,
                                            read_plane=read_plane)
                 continue
             views = views[: max(1, int(a.top_n))]
-            # Attached per view, not as one flat list on `curation`: which record an alternate is an
-            # alternate TO is the whole of its meaning, and a flat list throws that away. Zipped after
-            # the slice because the slice keeps a prefix and the two lists share their order.
+            # Attached per view, not as one flat list: which record an alternate is an alternate TO
+            # is the whole of its meaning. Zipped after the slice, which keeps a shared prefix.
             for view, alt_of in zip(views, alternates):
                 view["alternates"] = [_alternate(alt) for alt in alt_of[:ALTERNATES_LIMIT]]
                 view["alternates_omitted"] = max(0, len(alt_of) - ALTERNATES_LIMIT)
@@ -480,9 +456,8 @@ def _track_record_line(view: dict) -> str:
     if not view.get("recalls"):
         return "never benched by anyone since it was recorded"
     parts = ["%d reproduced a win" % view["validations"] if view["validations"] else "",
-             # Spelled out rather than folded into "none reproduced a win". Ran-and-lost is the
-             # bucket production actually fills now, and a reader told only that nobody won cannot
-             # tell it from a record nobody has ever managed to launch.
+             # Spelled out rather than folded into "none reproduced a win": ran-and-lost is the
+             # bucket production fills, and it must not read like nobody managed to launch it.
              "%d ran and did not win" % view["failures"] if view.get("failures") else "",
              "%d could not be run at all" % view["not_reproduced"]
              if view.get("not_reproduced") else "",
@@ -570,9 +545,9 @@ def _render_reference(refs_dir: str, cid: str, tier: str, views) -> str:
                 # bet from an untried one at the same speedup, and only this line says which it is.
                 "- track record: %s" % _track_record_line(v),
                 "- accepted kernels: %s" % (_kernel_line(v["accepted_kernels"]) or "none"),
-                # The same idea at other settings. Named, not offered: the config is not here and
-                # is not meant to be — this line exists so a Director whose first pick disappoints
-                # knows the direction was tried three ways before it reaches for a fourth.
+                # The same idea at other settings. Named, not offered — the config is not here:
+                # this tells a Director whose first pick disappoints that the direction was already
+                # tried three ways.
                 "- %s" % _alternates_line(v),
                 "- reproduce: %s" % _repro_line(v),
                 "- config:", "```json",
@@ -1520,23 +1495,21 @@ def _carrying_ledger(store, cid: str, sid: str, knowledge: dict) -> dict:
             "unretired_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "unretired_from_reason": reason})
         # The reprieve counted as what it is: a reproduction, on this box, of the record the
-        # retraction said was wrong. Recorded rather than merely flagged, because `should_retire`
-        # vetoes on `validations` — without this the negatives that earned the retraction are still
-        # the whole ledger, and the very next curation sweep retracts it again, forever.
+        # retraction called wrong. Recorded rather than flagged, because `should_retire` vetoes on
+        # `validations` — otherwise the next sweep retracts it again on the unchanged negatives.
         fresh["value"] = record_attestation(
             fresh["value"], "validated", actor="e2e_store write (un-retire)",
             evidence={"note": "re-measured into a validated win; lifted: " + reason[:120]})
-        # Preserved rather than dropped: these are the scores the record was carrying when it was
-        # retracted, and the whole point of showing them next to the new ones is that a reviewer
-        # can see whether the re-measurement actually answered the objection or changed the subject.
+        # Preserved rather than dropped: shown next to the new scores, they let a reviewer see
+        # whether the re-measurement answered the objection or changed the subject.
         withdrawn = (previous_value or {}).get("withdrawn_scores")
         if isinstance(withdrawn, dict) and withdrawn:
             fresh["value"]["withdrawn_scores"] = withdrawn
         return fresh
-    # Still retracted. Re-applied through retracted_document rather than by copying the flag,
-    # because a tombstone is not one field: retraction zeroes the top-level ranking scalars, and a
-    # `retained: False` sitting on a document that still carries a real `throughput_tok_s` is inert
-    # against every reader that ranks on the scalar (see kb/retract.py).
+    # Still retracted. Re-applied through retracted_document rather than by copying the flag: a
+    # tombstone is not one field — retraction also zeroes the ranking scalars, and `retained: False`
+    # on a document still carrying a live scalar is inert against readers that rank on it
+    # (kb/retract.py).
     return retracted_document(fresh, reason, (THROUGHPUT_METRIC, SPEEDUP_METRIC),
                               actor=str((previous_value or {}).get("retracted_by") or ""))
 
@@ -1629,10 +1602,9 @@ def cmd_curate(a) -> dict:
     would retire a record for a workload this run knows nothing about.
     """
     threshold = max(1, int(getattr(a, "threshold", RETIRE_THRESHOLD) or RETIRE_THRESHOLD))
-    # `ok` is present on EVERY return path, including the two that never reach a record. A sweep
-    # that could not read the page retracted nothing, which is safe, but reporting it as a success
-    # would make a mistyped --store indistinguishable from a clean page — and this is the command
-    # a caller is most likely to run unattended and check one field of.
+    # `ok` is present on EVERY return path, including the two that never reach a record: a sweep
+    # that could not read the page retracted nothing, and reporting that as success would make a
+    # mistyped --store indistinguishable from a clean page. This command runs unattended.
     out = {"applied": bool(a.apply), "threshold": threshold, "scanned": 0, "already_retired": 0,
            "kept": 0, "candidates": [], "rungs": [], "ok": True, "error": ""}
     cid, _tier, _metric, floor = ladder_of(a)[0]
@@ -1662,9 +1634,8 @@ def cmd_curate(a) -> dict:
             "speedup": finite_speedup(knowledge.get(SPEEDUP_METRIC)),
             "validated": bool(value.get("validated")),
             "is_champion": bool(candidate.is_champion),
-            # Both signals, because they answer different questions and a reviewer needs to see
-            # them disagree: the hint is why this record drew attention, the reason is why policy
-            # says it is done.
+            # Both signals, because a reviewer needs to see them disagree: the hint is why this
+            # record drew attention, the reason is why policy says it is done.
             "retire_hint": retire_hint(value),
             "reason": reason,
             "attestations": attestations_of(value)})

@@ -350,18 +350,13 @@ ok(/prove engagement/i.test(role) && /A recall is not an accept/.test(role),
 // H. a degraded worker costs a phase, not the run
 //
 // `safeAgent` returns null BY DESIGN once its retries are exhausted, and the phase has a landing for
-// it: the final `else` reports `gate=null/degraded`, files a dead_end on the ledger, and the run
-// continues into HeadKernel on the pre-tuning config. That landing is only reachable if everything
-// between the worker's return and it tolerates a null.
+// it: `gate=null/degraded`, a dead_end on the ledger, and the run continues into HeadKernel on the
+// pre-tuning config. That landing is only reachable if everything in between tolerates a null — and
+// the ops list is now read OUTSIDE `if (tuneOk)`, since a verdict on a recalled record is a per-op
+// fact that does not wait on the phase's aggregate bar, so `tuned`'s short-circuit no longer
+// screens it.
 //
-// While the ops list was read inside `if (tuneOk)` the null was screened off by `tuned`'s own
-// short-circuit. Hoisting the read out of the gate — which is what the attestation below it needs,
-// since a verdict on a recalled record is a per-op fact that does not wait on the phase's aggregate
-// bar — put it in FRONT of that screen, and a degraded worker took the whole run down with a
-// TypeError before HeadKernel and before any reporting. CI was green throughout: every case anyone
-// had written handed the block an object.
-//
-// So this section EXECUTES the shipped block rather than matching its text, which is the only way to
+// This section EXECUTES the shipped block rather than matching its text, which is the only way to
 // tell a guard that is present from a guard that works. Deps are injected; nothing here reaches an
 // agent, a store, a GPU or the network.
 // ---------------------------------------------------------------------------

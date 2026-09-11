@@ -87,23 +87,18 @@ _EVIDENCE_KEYS = ("measured_tok_s", "baseline_tok_s", "delta_pct", "measured_spe
 BUCKETS = ("validations", "failures", "not_reproduced", "inapplicable")
 
 # How many negative attempts, with no validation among them, make a record a retraction CANDIDATE.
-# Two, not one: a single box can be wrong about anything, and the first loss is the case this store
-# exists to survive. Not three, because the negatives that count here are the ones where the record
-# was actually applied and actually took effect — an `inapplicable` read never reaches this counter
-# — and waiting for a third means a known-bad record occupies its direction slot for one more full
-# run. Overridable per sweep (`curate --threshold`); this is the default the policy agreed on.
+# Two, not one: a single box can be wrong about anything. Not three: the negatives that reach this
+# counter are the ones where the record actually took effect (an `inapplicable` read never does),
+# and waiting costs a known-bad record one more full run in its direction slot. Overridable per
+# sweep (`curate --threshold`).
 RETIRE_THRESHOLD = 2
 
-# How far back "recently" reaches. The verdicts are read as a SLIDING WINDOW over the last few
-# attempts rather than as lifetime totals, because a lifetime `validations > 0` veto is permanent:
-# a record that won once in March and has lost every time since stays immune forever, keeps its
-# direction slot, and can never be curated out. Three, because two is the retire threshold itself
-# — a window equal to the threshold would let a single stale win be pushed out by the very two
-# losses that then fire the hint, with no grace at all — and because it gives a record that was
-# retracted and re-measured into a win (the reprieve in e2e_store.py:_carrying_ledger) three
-# further attempts before the window can turn against it again, which is the damper that stops it
-# oscillating. Widened to `threshold` when a sweep asks for a bar higher than the window could
-# ever reach; see `_retire_reason`.
+# How far back "recently" reaches. Verdicts are read as a SLIDING WINDOW rather than as lifetime
+# totals, because a lifetime `validations > 0` veto is permanent — a record that won once and has
+# lost ever since stays immune forever. Three, not two: a window equal to the retire threshold would
+# let a stale win be pushed out by the very two losses that then fire the hint, with no grace, and
+# three gives a reprieved record (e2e_store.py:_carrying_ledger) room before the window can turn
+# again. Widened to `threshold` when a sweep asks for a higher bar; see `_retire_reason`.
 RECENT_WINDOW = 3
 
 
@@ -194,15 +189,12 @@ def record_attestation(value: dict, outcome: str, *, actor: str = "", evidence=N
 def recent_verdicts(ledger: dict, window: int = RECENT_WINDOW):
     """The last `window` attempts that actually TESTED this record, oldest first.
 
-    `inapplicable` entries are skipped rather than counted, for the same reason they are subtracted
-    from the lifetime arithmetic below: such a read never got the stored configuration onto the box
-    at all — the reading run's own baseline pinned a knob the record also pins — so it judges the
-    pairing, not the record. Letting one occupy a window slot would push a real verdict out of view
-    and quietly reprieve a record for having been read on the wrong machine.
+    `inapplicable` entries are skipped, as they are in the lifetime arithmetic below: such a read
+    never got the stored configuration onto the box, so it judges the PAIRING, not the record.
+    Letting one occupy a window slot would push a real verdict out of view.
 
-    Empty when the ledger carries no usable history: a document hand-backfilled from counters, or
-    one written before `history` existed. Callers fall back to the lifetime counters there, which
-    is the only thing such a document can support.
+    Empty when the ledger carries no usable history (hand-backfilled, or written before `history`
+    existed); callers fall back to the lifetime counters there.
     """
     tested = [str(h.get("outcome") or "").strip().lower() for h in (ledger.get("history") or [])]
     tested = [o for o in tested if o in (VALIDATED, FAILED, NOT_REPRODUCED)]
@@ -215,16 +207,13 @@ def _retire_reason(value, threshold: int) -> str:
     The bar: among the last few attempts that ran the record, none reproduced a win and at least
     `threshold` of them came back negative.
 
-    Recency rather than totals is the whole point. A lifetime `validations > 0` veto is permanent —
-    a record that won once and has lost every time since stayed immune forever, kept its direction
-    slot against every alternative, and could never be curated out no matter how much evidence
-    accumulated against it. A window says what a reader actually wants to know: does this still
-    work HERE, NOW. It is still a veto and not a ratio: one win anywhere inside the window clears
-    the record outright, because a store this small cannot afford to retire something that is right
-    about anything.
+    Recency rather than totals is the point: a lifetime `validations > 0` veto is permanent, so a
+    record that won once and has lost ever since could never be curated out. A window asks what a
+    reader wants to know — does this still work HERE, NOW. Still a veto and not a ratio: one win
+    anywhere inside the window clears the record outright.
 
-    The window is widened to `threshold` when a sweep asks for a bar higher than RECENT_WINDOW, so
-    `curate --threshold 5` can still be met instead of being unreachable by construction.
+    The window widens to `threshold` when a sweep asks for a bar above RECENT_WINDOW, so
+    `curate --threshold 5` is not unreachable by construction.
     """
     ledger = attestations_of(value)
     threshold = max(1, int(threshold))
@@ -253,19 +242,14 @@ def retire_hint(value) -> str:
     Deliberately not a boolean: this is read by an agent prompt and by a human running a curation
     sweep, and both need to know WHICH pattern fired.
 
-    The read path DEMOTES on this, and does not filter on it. A hinted record sorts behind every
-    unhinted one in its group (see kb/curate.py:demote_hinted) — because the direction collapse
-    keeps only the first entry per group, a hinted record that happened to rank first was evicting
-    every good alternative behind it. But it is still on the page, still offered, still adoptable:
-    a record nobody has managed to reproduce is exactly the one worth keeping until something
-    better replaces it. Only `retract` removes a record from a read.
+    The read path DEMOTES on this, it does not filter on it: a hinted record sorts behind every
+    unhinted one in its group (kb/curate.py:demote_hinted), because the direction collapse keeps
+    only the first entry and a hinted record ranking first was evicting every good alternative.
+    It stays on the page, offered and adoptable; only `retract` removes it from a read.
 
-    Fires on the same evidence as `should_retire` at the default threshold, deliberately. The hint
-    must never be the LATER of the two signals: a record that can be retracted without ever having
-    been demoted spends its whole accumulating life evicting the alternatives in its direction
-    group, and then vanishes. Firing together still leaves a real window, because the demotion is
-    automatic and immediate while the retraction waits for a human to run `curate --apply` — which
-    may be never.
+    Fires on the same evidence as `should_retire` at the default threshold, deliberately — the hint
+    must never be the LATER signal. There is still a real window between them: the demotion is
+    immediate, while the retraction waits for a human to run `curate --apply`.
     """
     return _retire_reason(value, RETIRE_THRESHOLD)
 
@@ -276,10 +260,9 @@ def should_retire(value, *, threshold: int = RETIRE_THRESHOLD) -> str:
     Same predicate as `retire_hint`, with the sweep's own threshold instead of the default — see
     `_retire_reason` for the window and why it is a window.
 
-    NEVER acts. Returning a reason is not retracting: `retract_session` zeroes ranking scalars and
-    re-points the champion, and wiring that into the same pass that counts the evidence is exactly
-    the coupling the module docstring argues against. The caller is `e2e_store.py curate`, which is
-    a dry run unless a human passes --apply.
+    NEVER acts. Returning a reason is not retracting — `retract_session` zeroes ranking scalars and
+    re-points the champion, and the caller (`e2e_store.py curate`) is a dry run unless a human
+    passes --apply.
     """
     return _retire_reason(value, threshold)
 

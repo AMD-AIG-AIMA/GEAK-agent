@@ -1706,11 +1706,10 @@ def _carrying_remote_state(store, rec: dict, local_reproduced: bool):
     # a local meta.yaml can carry its own counts, and those were never at risk.
     report["carried_attestations"] = value.get("attestations") != fresh_value.get("attestations")
 
-    # Monotone, and it counts BOXES. The local number only ever knows what this tree has seen, so
-    # a rewrite from a clean tree carries 1; the remote number is the cross-box total and must not
-    # go backwards. When the remote already held this session but the local write filed a fresh
-    # entry rather than a `duplicate_impl`, this is a rediscovery the remote had not heard about,
-    # so it is worth one — otherwise the local write already counted it (see _record_reproduction).
+    # Monotone, and it counts BOXES: the local number knows only this tree, the remote one is the
+    # cross-box total and must not go backwards. A fresh local entry (not a `duplicate_impl`) over a
+    # session the remote already held is a rediscovery worth one; otherwise the local write already
+    # counted it (see _record_reproduction).
     previous_reps = _int_or(previous_value.get("reproductions"), 0)
     reps = max(_int_or(value.get("reproductions"), 1),
                previous_reps + (0 if local_reproduced else 1))
@@ -1726,54 +1725,43 @@ def _carrying_remote_state(store, rec: dict, local_reproduced: bool):
         return dict(rec, knowledge=knowledge), report
     reason = str(previous_value.get("retired_reason") or "").strip() \
         or "retracted; no reason recorded"
-    # A different bar to lift than e2e's, and it has to be. e2e un-retires when the incoming write
-    # is itself `validated`, which for that lane means a hot A/B strictly stronger than the gate its
-    # writes pass. This lane's write gate is only "beat 1.0x on the producer's own bench" — the very
-    # claim the retraction distrusted — so lifting on the write would let any re-run undo curation,
-    # which is the hazard being fixed here, just slower. Nor can it be the reproduction count: a
-    # retraction is normally written onto a record that already has one, so "one more write" would
-    # clear every tombstone on its next visit.
-    # What DOES clear it is the one signal a retraction is built from the absence of: somebody read
-    # this record, took it to a box, and reproduced the win. Same window `should_retire` reads, so
-    # the two cannot disagree about whether the record is currently believed.
+    # A higher bar to lift than e2e's, and it has to be. This lane's write gate is only "beat 1.0x
+    # on the producer's own bench" — the very claim the retraction distrusted — so lifting on the
+    # write would let any re-run undo curation. Nor can it be the reproduction count: a retraction
+    # normally lands on a record that already has one. What DOES clear it is the signal a retraction
+    # is built from the absence of — somebody read this record, took it to a box, and reproduced the
+    # win. Same window `should_retire` reads, so the two cannot disagree.
     if VALIDATED in recent_verdicts(attestations_of(value)):
-        # Cleared, not merely annotated. The incoming document is derived from a meta.yaml that may
-        # ITSELF say `retained: false` — the sync path re-files curated entries, so it usually does
-        # — and a record carrying both a tombstone flag and an `unretired_at` is a record no reader
-        # can act on: `is_retired` still hides it, while the lift claims it is believed again.
+        # Cleared, not merely annotated: the incoming document is usually derived from a meta.yaml
+        # that itself says `retained: false`, and a record carrying both that flag and an
+        # `unretired_at` is one no reader can act on.
         for gone in ("retained", "retired_reason", "retracted_at", "retracted_by"):
             value.pop(gone, None)
         value.update({"unretired_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                       "unretired_from_reason": reason})
-        # No attestation is counted for the reprieve, unlike e2e's. There, the write itself is the
-        # new evidence and has to enter the ledger or the next sweep re-retracts on the unchanged
-        # negatives. Here the evidence is a validated recall that is ALREADY in the window, so the
-        # veto already holds — and counting a recall nobody performed would break the one invariant
-        # the ledger has, that `recalls` is attempts on hardware.
+        # No attestation is counted for the reprieve, unlike e2e's: here the evidence is a
+        # validated recall ALREADY in the window, so the veto already holds — and counting a recall
+        # nobody performed would break the ledger's one invariant, that `recalls` is hardware.
         withdrawn = previous_value.get("withdrawn_scores")
         if isinstance(withdrawn, dict) and withdrawn:
             value["withdrawn_scores"] = withdrawn
         knowledge["value"] = value
         report["unretired"] = True
         return dict(rec, knowledge=knowledge), report
-    # Still retracted. Re-applied through retracted_document rather than by copying the flag,
-    # because a tombstone is not one field: retraction also zeroes the top-level ranking scalar,
-    # and `retained: False` on a document still carrying a real speedup is inert against every
-    # reader that ranks on the scalar (see kb/retract.py).
-    # The scores it was ORIGINALLY taken back for are moved across first, so retracted_document's
-    # setdefault leaves them alone: a reviewer judging the retraction needs the number that was
-    # retracted, not whatever this rewrite happened to measure onto the tombstone.
+    # Still retracted. Re-applied through retracted_document rather than by copying the flag: a
+    # tombstone is not one field — retraction also zeroes the ranking scalar, and `retained: False`
+    # on a document still carrying a speedup is inert against readers that rank on it
+    # (kb/retract.py). The ORIGINAL scores move across first so retracted_document's setdefault
+    # leaves them alone; a reviewer needs the number that was retracted.
     withdrawn = previous_value.get("withdrawn_scores")
     if isinstance(withdrawn, dict) and withdrawn:
         value["withdrawn_scores"] = withdrawn
     report["retracted"] = True
     tombstone = retracted_document(knowledge, reason, (CHAMPION_METRIC,),
                                    actor=str(previous_value.get("retracted_by") or ""))
-    # `retracted_document` stamps the moment it runs, which is right the first time and wrong every
-    # time after: this record was taken back once, and re-stamping it on each rewrite would date the
-    # retraction to whenever somebody last touched the patch. The lane now re-files entries on every
-    # warm start (`sync-local`), so an un-pinned timestamp would read as "curated seconds ago"
-    # forever, which is exactly what an auditor would use to decide the retraction is still current.
+    # `retracted_document` stamps the moment it runs — right the first time, wrong after. The lane
+    # re-files entries on every warm start (`sync-local`), so an un-pinned timestamp would read as
+    # "curated seconds ago" forever, which is what an auditor reads to judge a retraction current.
     when = str(previous_value.get("retracted_at") or "").strip()
     if when:
         tombstone["value"]["retracted_at"] = when
@@ -1952,11 +1940,9 @@ def cmd_sync_local(a) -> dict:
 
     synced, fresh, retired, promoted, errors = [], 0, 0, [], []
     for exp_dir, meta in entries:
-        # One bad entry must not stop the catch-up. The read that follows is better off with the
-        # rest of the backlog than with none of it, and an entry that cannot be filed is named here
-        # rather than leaving a page thin for a reason nothing recorded. Broad on purpose: hashing
-        # the payload, deriving the identity and writing it all fail differently, and none of them
-        # is worth losing the other entries over.
+        # One bad entry must not stop the catch-up: the read that follows is better off with the
+        # rest of the backlog, and the failure is named here rather than leaving a page thin for a
+        # reason nothing recorded. Broad on purpose — hash, identity and write all fail differently.
         try:
             recs = remote_records(meta, exp_dir, a.producer, a.gpu)
             files = {f["path"]: f["local_path"] for f in recs[0]["files"]}
@@ -1976,12 +1962,10 @@ def cmd_sync_local(a) -> dict:
                     r["knowledge"], reason, (CHAMPION_METRIC,),
                     actor=str(meta.get("retracted_by") or ""))) for r in plane_recs]
             elif _is_retired(meta) and not is_retired(held):
-                # The lift again, from the other side. `remote_value` copies `retained: false` out
-                # of the meta verbatim, so a document derived from a curated tree entry arrives
-                # carrying the flag even on the path that decided not to retract — and the flag
-                # alone is enough for `is_retired` to hide the record the recall just vindicated.
-                # Dropping it here is what makes "the store's own state wins" true of the WHOLE
-                # document and not only of the ranking scalar.
+                # The lift again, from the other side: `remote_value` copies `retained: false` out
+                # of the meta verbatim, so even the path that decided NOT to retract arrives
+                # carrying the flag — enough for `is_retired` to hide the record the recall just
+                # vindicated.
                 plane_recs = [dict(r, knowledge=dict(r["knowledge"], value={
                     k: v for k, v in (r["knowledge"].get("value") or {}).items()
                     if k not in ("retained", "retired_reason")})) for r in plane_recs]
@@ -2289,10 +2273,9 @@ def cmd_resolve_remote(a) -> dict:
     gfx = _norm_gfx(a.gfx)
     if not gfx and not a.canonical_id:
         return {"read_reason": "missing_arch", "candidates": []}
-    # Reading takes ONE plane at a time, never two merged: that would need a comparability rule
-    # across planes that nothing here has. `both` therefore picks, and picks the service first —
-    # `open_plane` would have handed back the local store, letting a stale mirror shadow the shared
-    # one without saying so. See kb/plane.py:read_planes.
+    # Reading takes ONE plane at a time, never two merged — that needs a cross-plane comparability
+    # rule nothing here has. `both` picks the service first, so a stale mirror cannot silently
+    # shadow the shared one (kb/plane.py:read_planes).
     planes, why = read_planes(a, CHAMPION_METRIC)
     if not planes:
         return {"read_reason": why.split(":", 1)[0], "reason": why, "candidates": []}
@@ -2323,28 +2306,24 @@ def cmd_resolve_remote(a) -> dict:
     # on a page with nothing to offer. Records written before carriers existed have no field and are
     # diffs; precision filters only when asked, and an entry that states none is kept — the whole
     # backlog predates the field.
-    # `--include-retired` keeps them instead, for an audit: the local `resolve` has had that escape
-    # hatch since it existed, and without it here there is no way to ask the service what curation
-    # took back. It also changes the DESCENT — a rung of nothing but tombstones now stops the ladder
-    # rather than reading empty — which is exactly what an auditor wants and exactly why it is a
-    # flag and not the default.
+    # `--include-retired` keeps them, for an audit — the local `resolve` has always had that escape
+    # hatch. It also changes the DESCENT: a rung of nothing but tombstones stops the ladder rather
+    # than reading empty, which is what an auditor wants and why it is a flag, not the default.
     want_carrier = str(getattr(a, "carrier", "") or "patch")
     want_precision = _norm_precision(getattr(a, "precision", ""))
     include_retired = bool(getattr(a, "include_retired", False))
     other_carrier = [0]
     other_precision = [0]
-    # What the page handed back before any of these filters ran, which is not the same as what the
-    # page HOLDS: the service ignores the `limit` argument and pages `--scan` rows (kb/store_remote
-    # .py:candidates), so a busy identity can be read through a keyhole with nothing saying so.
+    # What the page handed back before any filter ran — not what the page HOLDS: the service pages
+    # `--scan` rows (kb/store_remote.py:candidates), so a busy identity can be read through a
+    # keyhole with nothing saying so.
     scanned = [0]
-    # A rung that WAS read, and held live rows, but whose rows the carrier/precision filters took
-    # away is NOT a missing page — yet the descent empties it exactly like one, so without this it
-    # ends at `kernel_page_not_found` with an empty `read_plane`, which is what "nobody ever wrote
-    # this identity" looks like. The two are then indistinguishable to the caller, and the cheapest
-    # reading is the wrong one: a tuning lane asking for `--carrier tuned_artifact` gets told the
-    # page does not exist while a page full of installable diffs sits at that very address. The
-    # local `resolve` has always answered `no_such_carrier`/`no_such_precision` here; keep the first
-    # such rung so the remote answer can say the same thing, with the plane it really read.
+    # A rung that WAS read and held live rows, but whose rows the carrier/precision filters took
+    # away, is NOT a missing page — yet the descent empties it identically, ending at
+    # `kernel_page_not_found`, which is what "nobody ever wrote this identity" looks like. A tuning
+    # lane asking for `--carrier tuned_artifact` would be told the page does not exist while a page
+    # full of installable diffs sits at that address. Keep the first such rung so the remote answer
+    # can say `no_such_carrier`/`no_such_precision`, as the local `resolve` always has.
     witness = {}
 
     def live(canonical_id, tier):
@@ -2374,10 +2353,9 @@ def cmd_resolve_remote(a) -> dict:
                  other_precisions=other_precision[0])
         return of_precision, retired_n
 
-    # The WHOLE descent is redone on the next plane — ladder, then near misses — rather than
-    # stopping at the first page either plane happens to hold: a thin remote page must not shadow
-    # the hand-curated local tree, and a coarse rung on one plane must not shadow an exact rung on
-    # the other. `live` reads `store` from this scope, so rebinding it here re-points the closure.
+    # The WHOLE descent is redone on the next plane — ladder, then near misses — so a coarse rung
+    # on one plane cannot shadow an exact rung on the other. `live` reads `store` from this scope,
+    # so rebinding it re-points the closure.
     found, retired, read_plane = [], 0, ""
     for store, read_plane in planes:
         for cid, match_tier in ladder:
@@ -2410,11 +2388,10 @@ def cmd_resolve_remote(a) -> dict:
     above = [c for c in found if (c.speedup or 0.0) >= min_speedup]
     # `total` counts what the page held, `retired` how many of those were taken back — so the two
     # still sum to the page size even though `found` is already the survivors. Under
-    # `--include-retired` the tombstones ARE in `found`, so adding them again would double-count;
-    # `retired` still reports them, it just no longer names a set that was removed.
-    # `scan_saturated` is the honest caveat on all of the above: it says the numbers describe as
-    # much of the page as was fetched. Only the service truncates — LocalKBStore.candidates with
-    # limit=0 returns everything — so the local plane reports no limit rather than a false one.
+    # `--include-retired` the tombstones ARE in `found`, so they are reported but not re-added.
+    # `scan_saturated` is the caveat on all of it: the numbers describe as much of the page as was
+    # fetched. Only the service truncates, so the local plane reports no limit rather than a false
+    # one.
     scan_limit = max(1, int(getattr(a, "scan", 25) or 25)) if read_plane == "remote" else 0
     stats = {"total": len(found) + (0 if include_retired else retired), "retired": retired,
              "include_retired": include_retired,

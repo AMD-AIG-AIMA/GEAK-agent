@@ -115,19 +115,14 @@ if [ -n "${GEAK_VALIDATION_REPEAT_MODE:-}" ] \
 fi
 # ---- no-throughput carve-out ----
 # An invocation that produces no throughput number has no lifecycle to align, and the alignment
-# costs real money: warm_server would prepend a full NUM_PROMPTS round and clamp REPEATS to the
-# sample count.  Two such invocations exist -- PROFILE=1 (trace capture; it needs one warm server
-# and a sustained window, not a timed round) and REPEATS=0 (shape capture, which warm mode rejects
-# outright since zero timed rounds is not a sample count).
+# costs real money: warm_server prepends a full NUM_PROMPTS round and clamps REPEATS to the sample
+# count.  Two such invocations exist -- PROFILE=1 (trace capture, which needs a sustained window,
+# not a timed round) and REPEATS=0 (shape capture, which warm mode rejects outright).
 #
-# This is deliberately UNCONDITIONAL rather than a `${GEAK_REPEAT_MODE:-legacy}` default, and it
-# runs LAST so it also outranks the validation pin above.  An earlier revision only supplied the
-# default, on the theory that an explicit mode is a deliberate one -- but run_e2e.py pins
-# GEAK_REPEAT_MODE into os.environ for the whole process tree, so in every orchestrated run the
-# mode is always already set and the carve-out was a no-op exactly where it was needed: profiling
-# silently paid the extra full round, and kernel_extractor's REPEATS=0 shape capture died on
-# "REPEATS must be a positive integer".  Neither is a measurement, so neither gets a say in the
-# measurement protocol.
+# UNCONDITIONAL rather than a `${GEAK_REPEAT_MODE:-legacy}` default, and it runs LAST so it also
+# outranks the validation pin above: run_e2e.py pins GEAK_REPEAT_MODE into os.environ for the whole
+# process tree, so in an orchestrated run the mode is ALWAYS already set and a default-only
+# carve-out was a no-op exactly where it was needed.
 if [ "${PROFILE:-0}" = "1" ] && [ "${GEAK_REPEAT_MODE:-legacy}" != "legacy" ]; then
   echo ">>> PROFILE=1: using the single-server profiling lifecycle (not a timed measurement;" \
        "was ${GEAK_REPEAT_MODE})."
