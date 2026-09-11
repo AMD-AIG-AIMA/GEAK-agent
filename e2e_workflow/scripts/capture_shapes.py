@@ -38,6 +38,22 @@ _TMP_ARTIFACT_RE = re.compile(r"\.(?:pt|json)\.tmp-\d+")
 # Heuristic names for expert/static parameter tensors (used by moe_slim / share_large).
 _WEIGHT_KEY_RE = re.compile(
     r"(^w[123]$|^weight$|expert_w|gate_up|down_proj|up_proj|_weight$)", re.I)
+# Loader-attached tensor metadata (see _tensor_attrs). Intrinsic tensor fields are already recorded
+# as first-class snapshot keys; re-recording them from __dict__ would let a stale duplicate override
+# the real one on restore.
+_ATTR_SKIP = frozenset((
+    "shape", "dtype", "device", "data", "grad", "grad_fn", "requires_grad",
+    "names", "layout", "T", "mT", "real", "imag", "attrs", "contiguous",
+))
+_ATTR_MAX_COUNT = 32
+_ATTR_MAX_STR = 200
+# Environment that steers BACKEND DISPATCH (tuned-config tables, backend enables, arch pins). The
+# oracle records what the op was called with but not what the process was configured with, so a UT
+# replaying it cannot tell whether it reproduces the captured server's dispatch or a different one.
+# Recorded for comparison only — never re-exported automatically, since replaying with a table the
+# captured server did not have is its own infidelity.
+_ENV_CAPTURE_RE = re.compile(
+    r"^(AITER|GEAK|SGLANG|VLLM|TORCH|TORCHINDUCTOR|PYTORCH|TRITON|HIP|ROCM|HSA|CK|GPU)_|FLYDSL")
 
 _STATE = {
     "target": None, "out_dir": None, "max_cases": 5, "num_steps": 0,
@@ -371,6 +387,20 @@ def reclaim_workspace_captures(eval_dir, workspace_budget=0):
     return telemetry
 
 
+def _env_snapshot():
+    """Dispatch-steering environment of the capturing process (see ``_ENV_CAPTURE_RE``).
+
+    Lets a UT that reproduces the wrong kernel be diagnosed from the task dir instead of from server
+    logs: an empty ``AITER_CONFIG_FMOE`` here means the captured server ran the heuristic path, so a
+    UT that exports a tuned table is measuring a third code path that deployment never took.
+    """
+    env = {}
+    for key in sorted(os.environ):
+        if _ENV_CAPTURE_RE.search(key):
+            env[key] = str(os.environ[key])[:_ATTR_MAX_STR]
+    return env
+
+
 def _write_capture_manifest(out_dir, extra=None):
     """Lightweight size/shape manifest written when the heavy oracle is skipped or reclaiming."""
     s = _STATE
@@ -453,14 +483,67 @@ def _torch():
     return torch
 
 
+def _attr_value(value, depth=0):
+    """``(value, keep)`` — keep only attributes that survive ``torch.save`` as plain data.
+
+    Anything else (tensors, modules, callables, arbitrary objects) is dropped rather than repr'd: an
+    attribute the UT cannot faithfully restore is worse than an absent one, because a restored repr
+    string would still read truthy to a ``getattr(w, "...", False)`` dispatch gate.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, True
+    if isinstance(value, str):
+        return value[:_ATTR_MAX_STR], True
+    if depth == 0 and isinstance(value, (list, tuple)) and len(value) <= 8:
+        items = []
+        for item in value:
+            item_value, keep = _attr_value(item, depth + 1)
+            if not keep:
+                return None, False
+            items.append(item_value)
+        return type(value)(items), True
+    return None, False
+
+
+def _tensor_attrs(x):
+    """Loader-set Python attributes living in the tensor's ``__dict__``.
+
+    ``torch.save`` persists storage + dtype + shape but NOT attributes attached with ``setattr``, and
+    several backends carry their DISPATCH DECISION there rather than in the data: aiter's fused-MoE
+    gate reads ``getattr(w1, "is_shuffled", False)`` to choose FlyDSL vs CK. An oracle replayed
+    without that label silently runs a different kernel than the captured server did — the UT is then
+    named after one kernel and measures another, and its "speedup" is the branch flip, not the patch.
+    Intrinsic tensor fields are skipped; only extra metadata is recorded.
+    """
+    try:
+        items = list((getattr(x, "__dict__", None) or {}).items())
+    except Exception:
+        return {}
+    attrs = {}
+    for key, value in items:
+        if not isinstance(key, str) or key.startswith("_") or key in _ATTR_SKIP:
+            continue
+        attr_value, keep = _attr_value(value)
+        if not keep:
+            continue
+        attrs[key] = attr_value
+        if len(attrs) >= _ATTR_MAX_COUNT:
+            break
+    return attrs
+
+
 def _snapshot(x):
     """Detach+clone tensors to CPU so later in-place ops can't corrupt the oracle. Pass scalars/None
     through; summarize unsupported objects by repr so the record stays loadable."""
     torch = _torch()
     if torch.is_tensor(x):
-        return {"__tensor__": True, "data": x.detach().to("cpu").clone(),
+        snap = {"__tensor__": True, "data": x.detach().to("cpu").clone(),
                 "dtype": str(x.dtype), "device": str(x.device),
                 "shape": list(x.shape), "contiguous": bool(x.is_contiguous())}
+        attrs = _tensor_attrs(x)
+        if attrs:
+            snap["attrs"] = attrs
+        return snap
     if isinstance(x, (list, tuple)):
         return type(x)(_snapshot(v) for v in x)
     if isinstance(x, dict):
@@ -771,6 +854,7 @@ def _flush(write_oracle=True):
         "budget_exceeded": bool(s.get("budget_exceeded")),
         "budget_skip_count": int(s.get("budget_skip_count") or 0),
         "oracle_save_count": int(s.get("oracle_save_count") or 0),
+        "capture_env": _env_snapshot(),
         "build": False,  # default: pure-python/triton; Extractor flips to True for HIP/CK/asm tasks
         "note": "Oracle captured from baseline. Do NOT edit unittest.py or reference_io.pt during opt.",
     }

@@ -38,6 +38,7 @@ It exists to close two systematic "isolated win / e2e loss" holes that a naive p
       form (observed-vs-ceiling) available to any downstream e2e comparison; an observed delta far above
       the ceiling is box drift / measurement error, not the kernel.
 """
+import importlib.util
 import json
 import math
 import os
@@ -45,6 +46,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -548,11 +550,29 @@ def to_device_like(ref, dev):
     return ref.to(dev) if hasattr(ref, "to") else ref
 
 
+def apply_captured_attrs(t, attrs):
+    """Re-attach the loader-set attributes ``capture_shapes._tensor_attrs`` recorded.
+
+    MUST run AFTER any ``.to(device)``: ``.to()`` returns a fresh tensor whose ``__dict__`` is empty,
+    so attributes applied before the move are silently dropped — which is exactly how a replayed MoE
+    oracle loses ``w1.is_shuffled`` and falls into a different dispatch branch than deployment.
+    """
+    if not attrs:
+        return t
+    for key, value in attrs.items():
+        try:
+            setattr(t, key, value)
+        except (AttributeError, RuntimeError, TypeError):
+            pass   # tensor subclasses may refuse arbitrary attributes; a missing label beats a crash
+    return t
+
+
 def reconstruct_captured(obj, device="cpu"):
     """Inverse of capture_shapes._snapshot (shared refs must already be resolved)."""
     if isinstance(obj, dict) and obj.get("__tensor__"):
         t = obj["data"]
-        return t.to(device) if hasattr(t, "to") else t
+        t = t.to(device) if hasattr(t, "to") else t
+        return apply_captured_attrs(t, obj.get("attrs"))
     if isinstance(obj, dict) and set(obj.keys()) == {"__repr__"}:
         return obj["__repr__"]
     if isinstance(obj, dict):
@@ -1363,6 +1383,103 @@ def assert_legs_differ(task_dir, base, cand, meta, timeout=600):
     return bi, ci
 
 
+def _kernel_matcher():
+    """``kernel_matches`` from the vendored ``kernel_selection.py``, or None when it is absent.
+
+    Deliberately NOT re-implemented here: ``canonical_kernel_name`` must stay byte-identical to
+    ``canonicalDeviceKernel`` in e2e_workflow.js, and a second copy is a second thing to drift. The
+    extractor vendors ``kernel_selection.py`` into the task dir next to this file for exactly this.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name, path in (("kernel_selection", os.path.join(here, "kernel_selection.py")),):
+        try:
+            if name in sys.modules:
+                return getattr(sys.modules[name], "kernel_matches")
+            if not os.path.exists(path):
+                return None
+            spec = importlib.util.spec_from_file_location(name, path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            spec.loader.exec_module(mod)
+            return getattr(mod, "kernel_matches")
+        except Exception:
+            return None
+    return None
+
+
+def observed_device_kernels(call, cases, warmup=2):
+    """GPU kernel names one call of each case actually launches, newest-profile first.
+
+    The oracle records the op's INPUTS, never the process configuration that steers backend dispatch
+    (tuned-config env, backend enables, loader-set weight attributes). So a task can name itself after
+    one kernel and, on replay, run a different one end to end. This reads the kernel names off a
+    one-shot profile so that divergence is observable rather than silent.
+    """
+    torch = _torch()
+    from torch.profiler import ProfilerActivity, profile
+    seen = {}
+    for case in cases:
+        for _ in range(max(0, warmup)):
+            call(case)
+        sync(torch)
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            call(case)
+            sync(torch)
+        names = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "trace.json")
+            prof.export_chrome_trace(path)
+            with open(path) as fh:
+                doc = json.load(fh)
+        for event in (doc.get("traceEvents") if isinstance(doc, dict) else doc) or []:
+            if isinstance(event, dict) and str(event.get("cat") or "") == "kernel":
+                name = str(event.get("name") or "")
+                if name and name not in names:
+                    names.append(name)
+        seen[str(case.get("sig") or len(seen))] = names
+    return seen
+
+
+def assert_baseline_dispatch(task_dir, base, meta, timeout=600):
+    """Refuse to measure unless the BASELINE leg launches the kernel this task is named after.
+
+    The baseline leg is supposed to BE deployment. When it is not — because the replayed oracle lost a
+    loader-set dispatch label, or the capture-time env is not reproduced — every downstream number is
+    about a kernel production never ran, and the correctness gate cannot catch it: the golden was
+    frozen from that same wrong baseline, so it agrees with itself.
+
+    Raises ``HarnessIncompleteError`` (UT-GENERATION defect, exit 3 — NOT a candidate-correctness
+    failure) rather than returning False, so a mismatch reads as "regenerate the UT", never as
+    "reject the kernel". Skipped with a note when the profile yields no kernel names at all (CPU-only
+    box, profiler unavailable) — absence of evidence must not manufacture a verdict.
+    """
+    want = str((meta or {}).get("device_kernel") or "").strip()
+    matches = _kernel_matcher()
+    if not want or matches is None:
+        return {"checked": False, "why": "no device_kernel in meta" if not want
+                else "kernel_selection.py not vendored next to harness_lib.py"}
+    observed = _run_leg(os.path.abspath(task_dir), base, "dispatch", timeout=timeout)
+    per_case = (observed or {}).get("kernels") or {}
+    all_names = [n for names in per_case.values() for n in names]
+    if not all_names:
+        return {"checked": False, "why": "profile returned no device kernels", "device_kernel": want}
+    hit = [sig for sig, names in per_case.items() if any(matches(want, n) for n in names)]
+    if not hit:
+        reason = (
+            f"baseline leg never launches meta.device_kernel {want!r}; it launched "
+            f"{sorted(set(all_names))[:8]}. The task is named after one kernel and measures another, "
+            "so its speedup is a DISPATCH FLIP, not an optimization. Usual causes, in order: (1) the "
+            "oracle lost a loader-set weight attribute that gates the backend (capture_shapes records "
+            "these under 'attrs'; an oracle frozen before that must be recaptured), (2) meta.capture_env "
+            "differs from this process's env, (3) meta.device_kernel names a kernel the selected seam "
+            "does not reach. Recapture or re-select the seam — do NOT 'fix' this by exporting a tuned "
+            "config the captured server did not have, which is a THIRD code path.")
+        print(f"{UT_HARNESS_INCOMPLETE_SENTINEL}: {reason}")
+        raise HarnessIncompleteError(reason)
+    return {"checked": True, "device_kernel": want, "matched_cases": sorted(hit),
+            "per_case": per_case}
+
+
 def _median(xs):
     s = sorted(xs)
     n = len(s)
@@ -1399,6 +1516,7 @@ def measure_legs(task_dir, meta, *, timeout=3600, max_reps=3, undecided=(0.95, 1
     task = os.path.abspath(task_dir)
     base, cand = build_candidate_overlay(task, meta)
     assert_legs_differ(task, base, cand, meta)
+    assert_baseline_dispatch(task, base, meta)
     lo, hi = undecided
     per_case = []
     for sig in _run_leg(task, base, "list", timeout=timeout)["sigs"]:

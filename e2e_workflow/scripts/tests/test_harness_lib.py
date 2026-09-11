@@ -2307,6 +2307,58 @@ class TestRunLeg(_LegTestCase):
         self.assertIn("produced no JSON", str(cm.exception))
 
 
+class TestBaselineDispatchGate(_HarnessTestCase):
+    """The baseline leg must launch the kernel the task is NAMED after.
+
+    When it does not, the task measures a dispatch flip rather than an optimization -- and no existing
+    gate can catch it, because the golden was frozen from that same wrong baseline and so agrees with
+    itself. Observed on a real MoE task whose oracle had lost `w1.is_shuffled`: named after a FlyDSL
+    kernel, ran CK end to end, reported 1.55x isolated and 1.0034x e2e.
+    """
+
+    META = {"device_kernel": "mfma_moe1_silu_mul_afp4_wfp4_bf16_t32x128x256_pm1_async_v32"}
+
+    @contextlib.contextmanager
+    def _leg(self, kernels, matcher=None):
+        def run_leg(task, overlay, mode, **kw):
+            self.assertEqual(mode, "dispatch")
+            return {"kernels": kernels}
+
+        with _patched(hl, _run_leg=run_leg,
+                      _kernel_matcher=lambda: (matcher or (lambda w, g: w == g))):
+            yield
+
+    def test_matching_kernel_passes_and_reports_the_case(self):
+        with self._leg({"prefill_M16384": ["some_memcpy", self.META["device_kernel"]]}):
+            got = hl.assert_baseline_dispatch("/t", "/t/baseline_overlay", self.META)
+        self.assertTrue(got["checked"])
+        self.assertEqual(got["matched_cases"], ["prefill_M16384"])
+
+    def test_a_different_kernel_is_a_harness_defect_not_a_correctness_failure(self):
+        """HarnessIncompleteError => "regenerate the UT" (exit 3), never "reject the candidate"."""
+        with self._leg({"prefill_M16384": ["kernel_moe_mxgemm"]}):
+            with self.assertRaises(hl.HarnessIncompleteError) as cm:
+                hl.assert_baseline_dispatch("/t", "/t/baseline_overlay", self.META)
+        why = str(cm.exception)
+        self.assertIn("kernel_moe_mxgemm", why)
+        self.assertIn(self.META["device_kernel"], why)
+        # It must NOT advise exporting a tuned config the captured server did not have.
+        self.assertIn("do NOT", why)
+
+    def test_no_kernels_observed_is_reported_unchecked_never_a_verdict(self):
+        """Absence of evidence (CPU box, profiler unavailable) must not manufacture a failure."""
+        with self._leg({"prefill_M16384": []}):
+            got = hl.assert_baseline_dispatch("/t", "/t/baseline_overlay", self.META)
+        self.assertFalse(got["checked"])
+
+    def test_missing_matcher_or_device_kernel_degrades_to_unchecked(self):
+        with _patched(hl, _kernel_matcher=lambda: None,
+                      _run_leg=lambda *a, **k: self.fail("must not run a leg")):
+            self.assertFalse(hl.assert_baseline_dispatch("/t", "/b", self.META)["checked"])
+        with _patched(hl, _run_leg=lambda *a, **k: self.fail("must not run a leg")):
+            self.assertFalse(hl.assert_baseline_dispatch("/t", "/b", {})["checked"])
+
+
 class TestLegTimeoutReleasesTheGpu(_LegTestCase):
     """A timed-out leg must take everything it spawned with it.
 
@@ -2844,6 +2896,31 @@ class TestOracleSharedAndLazy(_HarnessTestCase):
         out = hl.to_device_like({"a": leaf, "b": [leaf]}, "cpu")
         self.assertIn("a", out)
         self.assertEqual(len(out["b"]), 1)
+
+    def test_reconstruct_captured_restores_loader_attrs_after_the_device_move(self):
+        """`.to()` returns a fresh tensor whose __dict__ is empty, so attrs must be re-applied AFTER.
+
+        This is the whole defect: aiter's fused-MoE gate reads `getattr(w1, "is_shuffled", False)`, so
+        an oracle replayed without the label dispatches to a different backend than the captured
+        server ran -- and the golden, frozen from that same wrong baseline, agrees with itself.
+        """
+        leaf = {"__tensor__": True, "data": _T((2,), fill=1.5),
+                "attrs": {"is_shuffled": True, "quant_mode": "mxfp4"}}
+        out = hl.reconstruct_captured(leaf, device="cuda")
+        self.assertIsNot(out, leaf["data"])          # the move really did make a new object
+        self.assertIs(getattr(out, "is_shuffled", False), True)
+        self.assertEqual(getattr(out, "quant_mode", None), "mxfp4")
+
+    def test_reconstruct_captured_without_attrs_is_unchanged(self):
+        out = hl.reconstruct_captured({"__tensor__": True, "data": _T((2,), fill=1.5)}, "cpu")
+        self.assertFalse(getattr(out, "is_shuffled", False))
+
+    def test_apply_captured_attrs_survives_a_tensor_that_refuses_setattr(self):
+        class _Frozen:
+            __slots__ = ()
+
+        frozen = _Frozen()
+        self.assertIs(hl.apply_captured_attrs(frozen, {"is_shuffled": True}), frozen)
 
     def test_reconstruct_captured_repr_and_containers(self):
         self.assertEqual(hl.reconstruct_captured({"__repr__": "x"}, "cpu"), "x")

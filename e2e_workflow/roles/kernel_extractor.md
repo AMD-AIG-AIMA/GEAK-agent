@@ -27,15 +27,30 @@ You are invoked once per kernel candidate. Read first:
   harness_lib.py        # VENDORED scripts/harness_lib.py — the SHARED timing/correctness lib; IMMUTABLE
   leg_runner.py         # VENDORED scripts/leg_runner.py — runs ONE leg under the ambient overlay; IMMUTABLE
   overlay_setup.py      # VENDORED scripts/overlay_setup.py — builds the candidate overlay; IMMUTABLE
+  kernel_selection.py   # VENDORED scripts/kernel_selection.py — supplies the kernel-name matcher the
+                        #   baseline dispatch gate uses; stdlib-only; IMMUTABLE
   unittest.py           # driver: h.measure_legs + h.run_correctness, prints the metric; IMMUTABLE
   meta.json             # name, source path, target_callable, candidate_bind, shapes, dtypes, backend,
                         #   regime, served_regimes, build, random_draws (default 3), checksum
 ```
-**Vendor the three shared scripts into the task dir**
-(`for f in harness_lib.py leg_runner.py overlay_setup.py; do cp "$SKILL_DIR/scripts/$f" "$TASK/"; done`).
+**Vendor the four shared scripts into the task dir**
+(`for f in harness_lib.py leg_runner.py overlay_setup.py kernel_selection.py; do cp "$SKILL_DIR/scripts/$f" "$TASK/"; done`).
 `unittest.py` imports `harness_lib` for ALL timing + correctness — never hand-roll a timing loop or an
 allclose check. This is what makes every task measure the same way; it also keeps the task
 self-contained + immutable (the validator sha-checks them alongside `reference_io.pt`).
+`kernel_selection.py` is vendored for its kernel-name matcher only (stdlib-only, no torch): without it
+`h.assert_baseline_dispatch` degrades to a no-op and the baseline is never proven to be deployment's
+code path.
+
+🔴 **Rehydrate the oracle with `h.reconstruct_captured` — never hand-roll the walk.** `capture_shapes`
+records more than data+dtype+shape: loader-set Python attributes (`attrs`) carry BACKEND DISPATCH
+DECISIONS, e.g. aiter's fused-MoE gate reads `getattr(w1, "is_shuffled", False)` to choose FlyDSL vs
+CK. `torch.save` does not persist them and `.to(device)` returns a fresh tensor that drops them, so a
+hand-written rehydrator silently replays the op on a DIFFERENT kernel than the captured server ran —
+and the golden, frozen from that same wrong baseline, agrees with itself. `h.reconstruct_captured`
+(and `h.iter_eager_cases_from_oracle` / `h.eager_cases_from_oracle`, which call it) re-apply `attrs`
+after the device move. If a task genuinely needs an extra step (e.g. a uint8 raw view for a packed
+fp4 operand), wrap `h.reconstruct_captured` — do not replace it.
 
 ### 🔴 THE TWO LEGS ARE THE SAME CODE UNDER TWO PYTHONPATHS — read this before writing anything
 There is no `baseline_callable`, and no second copy of the source to time against. Both legs run the
