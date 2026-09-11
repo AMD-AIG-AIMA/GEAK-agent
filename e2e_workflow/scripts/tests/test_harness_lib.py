@@ -2765,6 +2765,46 @@ class TestBaselineRandomOutputs(_LegTestCase):
         self.assertEqual(loaded, [(dest, "cpu")])          # CPU-side, so either leg can compare it
         self.assertEqual(list(got), ["decode|0"])
 
+    def test_a_repeat_recording_gets_its_own_file_so_it_cannot_clobber_the_first(self):
+        self.torch.load = lambda path, map_location=None: {}
+        self._script(lambda cmd, env: _Proc(0, '{"out": "x", "n": 1}'))
+        hl.baseline_random_outputs(self.task, self.meta, rep=1)
+        self.assertEqual(self.sub.flag("--out"),
+                         os.path.join(self.task, "_baseline_random.rep1.pt"))
+
+
+class TestBaselineNoiseFloor(_LegTestCase):
+    """An op that reduces with atomics does not reproduce ITSELF bit-for-bit. Measure that spread
+    with the same metric the candidate is judged by, or the candidate is blamed for it."""
+
+    def _blobs(self, second):
+        blobs = {"_baseline_random.pt": {"m1|0": _T((2,), [1.0, 2.0])},
+                 "_baseline_random.rep1.pt": {"m1|0": second}}
+        self.torch.load = lambda path, map_location=None: blobs[os.path.basename(path)]
+        self._script(lambda cmd, env: _Proc(0, '{"out": "x", "n": 1}'))
+
+    def test_the_baseline_is_recorded_twice_at_the_same_seed_and_scored_against_itself(self):
+        self._blobs(_T((2,), [1.0, 2.2]))
+        floor = hl.baseline_noise_floor(self.task, self.meta, 0.01, seed=7)
+        self.assertEqual(self.sub.modes(), ["oracle", "oracle"])
+        self.assertEqual({c["cmd"][c["cmd"].index("--seed") + 1] for c in self.sub.calls}, {"7"})
+        self.assertAlmostEqual(floor["m1|0"], 0.2 / (2.0 + 0.01 * math.sqrt(2.5)), places=6)
+
+    def test_an_already_recorded_first_pass_is_reused_rather_than_paid_for_twice(self):
+        self._blobs(_T((2,), [1.0, 2.0]))
+        floor = hl.baseline_noise_floor(self.task, self.meta, 0.01,
+                                        baseline_outputs={"m1|0": _T((2,), [1.0, 2.0])})
+        self.assertEqual(self.sub.modes(), ["oracle"])     # only the REPEAT leg runs
+        self.assertEqual(floor, {"m1|0": 0.0})
+
+    def test_a_key_the_repeat_did_not_produce_gets_no_floor_instead_of_a_zero_one(self):
+        """A zero floor would read as 'proven deterministic' — the opposite of 'unmeasured'."""
+        self._blobs(_T((2,), [1.0, 2.0]))
+        floor = hl.baseline_noise_floor(self.task, self.meta, 0.01,
+                                        baseline_outputs={"m1|0": _T((2,), [1.0, 2.0]),
+                                                          "m1|1": _T((2,), [1.0, 2.0])})
+        self.assertEqual(list(floor), ["m1|0"])
+
 
 # --------------------------------------------------------------------------- #
 # The recorded-oracle arm of check_random_vs_baseline / run_correctness
@@ -2829,6 +2869,31 @@ class TestCheckRandomVsBaselineRecorded(_HarnessTestCase):
             [self._shape()], 0.01, draws=1, baseline_outputs={"m1|0": ref})
         self.assertTrue(ok, per[0].get("note"))
         self.assertEqual([t.device for t in ref], ["cpu", "cpu"])   # oracle not mutated
+
+    def test_a_deviation_inside_the_baselines_own_spread_passes_and_says_so(self):
+        """The 0.559 'relative error' that failed the FlyDSL MoE UT was the baseline against
+        ITSELF. Without this the honest candidate is failed for the op's atomic reduction order."""
+        ok, per = hl.check_random_vs_baseline(
+            None, lambda args: _T((2,), [1.0, 2.2]), [self._shape()], 0.01, draws=1,
+            baseline_outputs={"m1|0": _T((2,), [1.0, 2.0])}, noise_floor={"m1|0": 0.1})
+        self.assertTrue(ok)
+        self.assertTrue(per[0]["correct"])
+        self.assertEqual(per[0]["noise_floor"], 0.1)
+        self.assertIn("run-to-run spread", per[0]["note"])
+
+    def test_a_deviation_past_the_margin_still_fails(self):
+        ok, per = hl.check_random_vs_baseline(
+            None, lambda args: _T((2,), [1.0, 2.2]), [self._shape()], 0.01, draws=1,
+            baseline_outputs={"m1|0": _T((2,), [1.0, 2.0])}, noise_floor={"m1|0": 0.001})
+        self.assertFalse(ok)
+        self.assertFalse(per[0]["correct"])
+
+    def test_a_key_with_no_measured_floor_is_judged_as_strictly_as_before(self):
+        ok, per = hl.check_random_vs_baseline(
+            None, lambda args: _T((2,), [1.0, 2.2]), [self._shape()], 0.01, draws=1,
+            baseline_outputs={"m1|0": _T((2,), [1.0, 2.0])}, noise_floor={"other|0": 9.9})
+        self.assertFalse(ok)
+        self.assertIsNone(per[0]["noise_floor"])
 
     def test_a_candidate_that_returns_no_tensor_is_named_rather_than_compared(self):
         ok, per = hl.check_random_vs_baseline(

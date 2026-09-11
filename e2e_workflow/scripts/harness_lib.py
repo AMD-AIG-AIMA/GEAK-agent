@@ -890,7 +890,7 @@ def check_graph_replay(fill, run, read_out, cases, tol, capture_idx=0, warmup=3)
 # --------------------------------------------------------------------------- (b) random-value parity vs live baseline
 def check_random_vs_baseline(baseline_call, current_call, shapes, tol,
                              draws=3, warmup=10, repeats=50, inner=1, graph=False, seed=0,
-                             baseline_outputs=None):
+                             baseline_outputs=None, noise_floor=None, noise_margin=2.0):
     """Validate the candidate against the LIVE frozen baseline on MANY RANDOM INPUT VALUE DRAWS at the
     SAME online-aligned shapes (NOT random shapes — dims are fixed per `sig`, only values vary). The
     frozen oracle (`reference_io.pt`) pins ONE recorded input+golden; this catches value-dependent bugs
@@ -911,6 +911,10 @@ def check_random_vs_baseline(baseline_call, current_call, shapes, tol,
         `"<sig>|<draw>"`. Same seed => same inputs, so the two legs never have to be co-resident. When
         it is given, `baseline_call` is ignored and `speedup` is None here (timing comes from
         `measure_legs`).
+    `noise_floor` (from `baseline_noise_floor`) = per-key error the BASELINE shows against ITSELF at the
+        same seed. A case that misses `tol` but stays within `noise_margin` x that floor is passed and
+        labelled — the deviation is the op's own launch-to-launch reduction order, not the candidate's.
+        Absent (None) the gate is exactly as strict as before.
     `baseline_call(args) -> out` is the LEGACY in-process form, kept for op_bench / single-process tasks.
         `current_call(args) -> out` invokes the candidate in kernel_src/.
     `shapes` is a list of {"sig": <label>, "make_inputs": callable(rng) -> args}. `make_inputs` builds a
@@ -949,6 +953,13 @@ def check_random_vs_baseline(baseline_call, current_call, shapes, tol,
                                  "speedup": None, "note": f"value-parity raised: {e!r}"})
                 continue
             ok, err = correct(cand_out, base_snap, tol)
+            note = "value-parity vs live baseline (correctness gates; speedup reports)"
+            floor = (noise_floor or {}).get(f"{sig}|{i}")
+            if not ok and floor is not None and math.isfinite(err) and math.isfinite(floor) \
+                    and err <= floor * noise_margin:
+                ok = True
+                note = (f"within the baseline's own run-to-run spread "
+                        f"(err {err:.5g} <= {noise_margin}x floor {floor:.5g})")
             all_ok = all_ok and ok
             if baseline_outputs is not None:
                 speedup = None                             # timing belongs to measure_legs, not here
@@ -959,7 +970,8 @@ def check_random_vs_baseline(baseline_call, current_call, shapes, tol,
             per_case.append({"case": f"random[{i}]:{sig}", "correct": ok,
                              "max_rel_err": round(err, 5) if math.isfinite(err) else None,
                              "speedup": round(speedup, 3) if speedup else None,
-                             "note": "value-parity vs live baseline (correctness gates; speedup reports)"})
+                             "noise_floor": round(floor, 5) if floor is not None and math.isfinite(floor) else None,
+                             "note": note})
     return all_ok, per_case
 
 
@@ -1200,7 +1212,8 @@ UT_HARNESS_INCOMPLETE_SENTINEL = "UT_HARNESS_INCOMPLETE"
 # deployment fact `deployment_graph_mode(regime)` (regime.cuda_graph, from the launch flags), and a
 # graph-deploy kernel that supplies no >=2-shape replay bundle FAILS CLOSED instead of silently passing.
 def run_correctness(regime, *, eager_cases, current_call, random_shapes, tol,
-                    baseline_call=None, baseline_outputs=None, replay=None, draws=3):
+                    baseline_call=None, baseline_outputs=None, replay=None, draws=3,
+                    noise_floor=None):
     """The SINGLE correctness entrypoint every generated unittest must call. Runs, in order:
       1. eager multi-case vs oracle (`check_correct_multi`) — also the output-independence check;
       2. random-value parity vs the frozen live baseline (`check_random_vs_baseline`);
@@ -1229,7 +1242,7 @@ def run_correctness(regime, *, eager_cases, current_call, random_shapes, tol,
                          "leg via baseline_random_outputs) or a legacy in-process baseline_call")
     r_ok, perr = check_random_vs_baseline(baseline_call, current_call, random_shapes, tol,
                                           draws=draws, graph=deployment_graph_mode(regime),
-                                          baseline_outputs=baseline_outputs)
+                                          baseline_outputs=baseline_outputs, noise_floor=noise_floor)
     report["random"] = perr
     ok = ok and r_ok
 
@@ -1607,11 +1620,33 @@ def measure_legs(task_dir, meta, *, timeout=3600, max_reps=3, undecided=(0.95, 1
     return per_case
 
 
-def baseline_random_outputs(task_dir, meta, *, seed=0, draws=0, timeout=3600):
+def baseline_random_outputs(task_dir, meta, *, seed=0, draws=0, timeout=3600, rep=0):
     """Random-draw outputs recorded by the BASELINE leg in its own process, for
-    `check_random_vs_baseline(baseline_outputs=...)`. Same seed => same inputs on both sides."""
+    `check_random_vs_baseline(baseline_outputs=...)`. Same seed => same inputs on both sides.
+    `rep` only picks a distinct output file so the SAME recording can be taken twice
+    (see `baseline_noise_floor`)."""
     task = os.path.abspath(task_dir)
-    out = os.path.join(task, "_baseline_random.pt")
+    out = os.path.join(task, "_baseline_random.pt" if not rep else f"_baseline_random.rep{int(rep)}.pt")
     _run_leg(task, os.path.join(task, "baseline_overlay"), "oracle",
              out=out, seed=seed, draws=draws, timeout=timeout)
     return _torch().load(out, map_location="cpu")
+
+
+def baseline_noise_floor(task_dir, meta, tol, *, seed=0, draws=0, timeout=3600, baseline_outputs=None):
+    """The BASELINE leg's own run-to-run spread, as `{"<sig>|<draw>": max_rel_err}`.
+
+    Records the baseline a SECOND time at the same seed — same inputs, same code, same overlay — and
+    scores it against the first with the very metric the candidate is judged by. Whatever comes back
+    is not the candidate's error; it is the floor. Kernels that accumulate with atomics or split-k
+    (FlyDSL MoE, persist_cu* variants) reorder their reduction per launch, and `correct`'s
+    `atol = tol*RMS(ref)` turns a 1e-05 absolute wobble on a near-zero element into a 0.5 "relative
+    error". Holding a candidate below a floor the baseline cannot hold itself to fails honest kernels.
+    Costs one extra oracle leg (~15-25s); skip it only for provably deterministic ops."""
+    a = baseline_outputs if baseline_outputs is not None else baseline_random_outputs(
+        task_dir, meta, seed=seed, draws=draws, timeout=timeout)
+    b = baseline_random_outputs(task_dir, meta, seed=seed, draws=draws, timeout=timeout, rep=1)
+    floor = {}
+    for k, ref in a.items():
+        if k in b:
+            floor[k] = correct(b[k], ref, tol)[1]
+    return floor

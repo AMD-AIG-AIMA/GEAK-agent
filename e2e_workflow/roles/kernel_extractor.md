@@ -338,8 +338,15 @@ freeze an out-of-regime oracle nobody should trust.
      case sigs). The BASELINE leg records its outputs for those draws in its own process:
      ```python
      base_out = h.baseline_random_outputs(TASK, meta, draws=meta.get("random_draws", 3))
+     floor = h.baseline_noise_floor(TASK, meta, tol, draws=meta.get("random_draws", 3),
+                                    baseline_outputs=base_out)   # pass to run_correctness(noise_floor=)
      ```
-     and the candidate is compared against them (same seed ⇒ same inputs). **🔴 Do NOT randomize SHAPES
+     and the candidate is compared against them (same seed ⇒ same inputs). **🔴 Always pass
+     `noise_floor=`.** Records the baseline a second time at the same seed and scores it against the
+     first: an op that reduces with atomics or split-k (FlyDSL MoE, `persist_cu*`) does not reproduce
+     itself bit-for-bit, and `correct`'s `atol = tol*RMS(ref)` inflates a 1e-05 wobble on a near-zero
+     element into a ~0.5 "relative error". Without the floor the honest candidate is FAILED for the
+     baseline's own nondeterminism. Costs one extra oracle leg (~15-25s). **🔴 Do NOT randomize SHAPES
      — dims stay online-aligned; only the input VALUES vary.** Fold its correctness verdict into the
      overall PASS/FAIL (a delta vs
      baseline on ANY draw FAILS the unittest); print its per-draw `speedup` as a SECONDARY robustness
