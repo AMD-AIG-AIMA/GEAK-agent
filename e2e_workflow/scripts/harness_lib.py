@@ -593,18 +593,29 @@ def apply_declared_attrs(args, meta):
     no-op unless meta also declares something (an explicit declaration wins, so a hand-written
     correction can override a bad recording).
 
-    ``args`` is the ``{"pos": [...], "kw": {...}}`` bundle cases.py passes to ``call``. An operand is
-    addressed by kwarg name, or by ``"pos[<i>]"`` for a positional. RAISES on a declaration that
-    matches no operand: this mechanism previously shipped as a per-task helper that returned early on
-    an empty spec, so a typo'd or stale name read exactly like "nothing to restore" and the UT went
-    on quietly measuring the wrong dispatch branch. A declaration that does not land is a defect in
-    the UT, not a condition to tolerate.
+    ``args`` is whatever bundle cases.py passes to ``call``. BOTH shapes in use are accepted: the
+    ``{"pos": [...], "kw": {...}}`` split that generated tasks build, and the flat kwargs mapping the
+    role sketch spells ``fn(**args)`` (which is also what ``iter_eager_cases_from_oracle`` yields). A
+    bare list/tuple of positionals works too. Accepting only one of them would make a shape mismatch
+    raise the "name does not land" error below and send the author to audit a meta key that is fine.
+    An operand is addressed by kwarg name, or by ``"pos[<i>]"`` for a positional.
+
+    RAISES on a declaration that matches no operand: this mechanism previously shipped as a per-task
+    helper that returned early on an empty spec, so a typo'd or stale name read exactly like "nothing
+    to restore" and the UT went on quietly measuring the wrong dispatch branch. A declaration that
+    does not land is a defect in the UT, not a condition to tolerate.
     """
     spec = (meta or {}).get("live_tensor_attrs") or {}
     if not spec:
         return args
-    pos = list(args.get("pos") or ())
-    kw = args.get("kw") or {}
+    if isinstance(args, dict) and ("pos" in args or "kw" in args):
+        pos, kw = list(args.get("pos") or ()), (args.get("kw") or {})
+    elif isinstance(args, dict):
+        pos, kw = [], args
+    elif isinstance(args, (list, tuple)):
+        pos, kw = list(args), {}
+    else:
+        pos, kw = [], {}
     missing = []
     for name, attrs in spec.items():
         m = re.match(r"^pos\[(\d+)\]$", str(name))
@@ -652,8 +663,13 @@ def resolve_oracle_shared(obj, shared):
     return obj
 
 
-def iter_eager_cases_from_oracle(path, device="cpu"):
-    """Yield ``{args, ref, sig, regime}`` one record at a time (memory-friendly for multi-GiB MoE)."""
+def iter_eager_cases_from_oracle(path, device="cpu", meta=None):
+    """Yield ``{args, ref, sig, regime}`` one record at a time (memory-friendly for multi-GiB MoE).
+
+    Pass ``meta`` whenever the task declares ``live_tensor_attrs``: without it the CORRECTNESS cases
+    come back missing the dispatch flag the timing legs were retrofitted with, so the two gates grade
+    different backends — the split this whole mechanism exists to close.
+    """
     blob = load_reference_io(path, map_location="cpu")
     shared = blob.get("shared") or {}
     for record in blob.get("records") or []:
@@ -669,16 +685,16 @@ def iter_eager_cases_from_oracle(path, device="cpu"):
             for name, value in zip(names, args_pos):
                 args.setdefault(name, value)
         yield {
-            "args": args,
+            "args": apply_declared_attrs(args, meta),
             "ref": ref,
             "sig": record.get("sig", ""),
             "regime": record.get("regime", ""),
         }
 
 
-def eager_cases_from_oracle(path, device="cpu"):
+def eager_cases_from_oracle(path, device="cpu", meta=None):
     """Materialize all eager cases; prefer ``iter_eager_cases_from_oracle`` for large oracles."""
-    return list(iter_eager_cases_from_oracle(path, device=device))
+    return list(iter_eager_cases_from_oracle(path, device=device, meta=meta))
 
 
 def check_correct_multi_lazy(call, case_iter, tol, max_keep_live=2):

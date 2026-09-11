@@ -2324,6 +2324,20 @@ class TestDeclaredAttrs(_HarnessTestCase):
         hl.apply_declared_attrs(args, {"live_tensor_attrs": {"pos[1]": {"is_shuffled": True}}})
         self.assertTrue(getattr(w, "is_shuffled", False))
 
+    def test_the_flat_kwargs_shape_is_accepted_too(self):
+        """The role sketch spells `call` as `fn(**args)`, and `iter_eager_cases_from_oracle` yields a
+        flat mapping. Accepting only the pos/kw split would raise "name does not land" on a perfectly
+        good meta and send the author auditing the wrong file."""
+        w1 = _T((2, 2))
+        args = {"w1": w1, "doweight_stage1": False}
+        hl.apply_declared_attrs(args, {"live_tensor_attrs": {"w1": {"is_shuffled": True}}})
+        self.assertTrue(getattr(w1, "is_shuffled", False))
+
+    def test_a_bare_positional_sequence_is_accepted_too(self):
+        w = _T((2, 2))
+        hl.apply_declared_attrs([_T((1,)), w], {"live_tensor_attrs": {"pos[1]": {"is_shuffled": True}}})
+        self.assertTrue(getattr(w, "is_shuffled", False))
+
     def test_no_declaration_is_a_no_op(self):
         args = {"pos": [], "kw": {"w1": _T((2, 2))}}
         self.assertIs(hl.apply_declared_attrs(args, {}), args)
@@ -3049,6 +3063,26 @@ class TestOracleSharedAndLazy(_HarnessTestCase):
         self.assertIn("hidden_states", case["args"])
         self.assertIn("w1", case["args"])
         self.assertEqual(case["args"]["scale"], 1.0)
+
+    def test_eager_cases_apply_declared_attrs_when_meta_is_passed(self):
+        """Otherwise the retrofit reaches the TIMING legs (cases.py applies it) but not the frozen
+        correctness cases, and the two gates grade different backends -- the split this mechanism
+        exists to close. No meta => unchanged, so old callers keep working."""
+        blob = {
+            "shared": {},
+            "records": [{
+                "sig": "s0",
+                "args": (),
+                "kwargs": {"w1": {"__tensor__": True, "data": _T((2, 2), fill=1.0)}},
+                "output": {"__tensor__": True, "data": _T((2,), fill=2.0)},
+            }],
+        }
+        self.torch.load = lambda *a, **k: blob
+        plain = next(hl.iter_eager_cases_from_oracle("ref.pt"))
+        self.assertFalse(getattr(plain["args"]["w1"], "is_shuffled", False))
+        meta = {"live_tensor_attrs": {"w1": {"is_shuffled": True}}}
+        case = next(hl.iter_eager_cases_from_oracle("ref.pt", meta=meta))
+        self.assertTrue(getattr(case["args"]["w1"], "is_shuffled", False))
 
     def test_check_correct_multi_lazy_runs_independence_with_two_cases(self):
         def call(args):

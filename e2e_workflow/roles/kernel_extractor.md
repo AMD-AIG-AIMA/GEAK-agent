@@ -490,22 +490,29 @@ freeze an out-of-regime oracle nobody should trust.
    is still a byte-copy of the baseline file, so the legs differ by PATH while `speedup≈1.0` — that is
    the expected smoke result. If the target cannot be resolved on the live stack at all, do NOT fall
    back to a `kernel_src/` strawman: return `editable:false` with a clear reason.
-   > **Exit-code contract — a missing replay leg is a UT DEFECT, not a kernel/smoke failure.** The UT
-   > routes correctness through `h.run_correctness(...)`, which for a graph-deploy kernel (`cuda_graph=true`)
-   > RAISES `h.HarnessIncompleteError` when no ≥2-shape replay bundle was wired — and it has ALREADY
-   > printed the `UT_HARNESS_INCOMPLETE: …` sentinel line itself (so the smoke sees it even if `main()`
-   > forgets to catch). The generated `main()` MUST translate the exception to a DEDICATED exit code; do
-   > NOT re-print the sentinel (it is already on stdout — a second print is just noise):
+   > **Exit-code contract — a missing replay leg or a wrong baseline is a UT DEFECT, not a kernel/smoke
+   > failure.** TWO harness calls raise `h.HarnessIncompleteError`: `h.run_correctness(...)`, when a
+   > graph-deploy kernel (`cuda_graph=true`) was wired no ≥2-shape replay bundle, and `h.measure_legs(...)`,
+   > when `h.assert_baseline_dispatch` finds the BASELINE leg never launches `meta.device_kernel`. Both
+   > have ALREADY printed the `UT_HARNESS_INCOMPLETE: …` sentinel line themselves (so the smoke sees it
+   > even if `main()` forgets to catch). The generated `main()` MUST translate the exception to a
+   > DEDICATED exit code — wrap **both** calls, not just correctness, or a dispatch mismatch escapes as
+   > an uncaught traceback and is scored as exit 1, the one code reserved for a genuine kernel failure.
+   > Do NOT re-print the sentinel (it is already on stdout — a second print is just noise):
    > ```python
    > try:
+   >     per_case = h.measure_legs(TASK, META)                    # raises if the baseline is not deployment
    >     ok, report = h.run_correctness(META["regime"], ...)      # eager+random+replay legs
    > except h.HarnessIncompleteError:
    >     sys.exit(3)                                              # 3 = regenerate UT (sentinel already printed)
    > sys.exit(0 if ok else 1)                                     # 1 = real correctness FAIL, 2 = env
    > ```
-   > On smoke **exit 3 OR a `UT_HARNESS_INCOMPLETE` line on stdout: REGENERATE the UT** — add the replay
-   > bundle (build ≥2 boundary cases via `h.boundary_decode_seq_lens`/`h.shuffled_block_table` for attn, or
-   > the family×M-buckets for gemm; wire `fill/run/read_out`) and re-run the smoke. Retry up to 3 times.
+   > On smoke **exit 3 OR a `UT_HARNESS_INCOMPLETE` line on stdout: REGENERATE the UT** — read WHICH
+   > defect the sentinel names. Missing replay bundle: add it (build ≥2 boundary cases via
+   > `h.boundary_decode_seq_lens`/`h.shuffled_block_table` for attn, or the family×M-buckets for gemm;
+   > wire `fill/run/read_out`). Baseline dispatch mismatch: recapture the oracle, declare the lost
+   > attribute in `meta.live_tensor_attrs`, or re-select the seam — NEVER by exporting a tuned config
+   > the captured server did not have. Then re-run the smoke. Retry up to 3 times.
    > Do **NOT** record `unittest_smoke:"fail"` or drop the head for exit 3 — that status is reserved for a
    > genuine baseline-bind / correctness failure (exit 1). Only after 3 failed regenerations set
    > `unittest_smoke:"fail"` with `reason="harness_incomplete_unrecoverable"`.
