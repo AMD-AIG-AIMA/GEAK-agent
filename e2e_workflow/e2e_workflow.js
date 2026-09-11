@@ -3338,7 +3338,17 @@ if (want('tune') && TUNING_SKILLSET_ENABLED) {
   // Every op the skillset named, regardless of what the phase did with them as a group. Read twice
   // below: by the accepted-kernel banking, which is gated on `tuneOk`, and by the attestation
   // immediately under this, which deliberately is not.
-  const tunedOps = (tuning.ops_tuned || []).filter((o) => String(o.op || o.short_name || '').trim());
+  //
+  // `tuning &&`, not just `.ops_tuned ||`: `safeAgent` returns null by DESIGN once its retries are
+  // exhausted, and the phase has a landing for that — the final `else` reports `gate=null/degraded`
+  // and the run continues into HeadKernel on the pre-tuning config. While this read sat inside
+  // `if (tuneOk)` the null was screened off by `tuned`'s own short-circuit; hoisting it out of the
+  // gate (which is the point of the attestation below) put it in front of that screen, and a
+  // degraded worker took the whole run down with a TypeError instead of costing it one phase.
+  // Empty here is the correct answer for a null worker: nothing was tuned, so nothing is attestable
+  // and nothing is bankable, and both loops below fall through on length.
+  const tunedOps = ((tuning && tuning.ops_tuned) || [])
+    .filter((o) => String(o.op || o.short_name || '').trim());
 
   // The other half of the recall loop. A RECALLED table that installs but never binds looks exactly
   // like an empty page to the next run unless this box says so on the record itself; the write below
