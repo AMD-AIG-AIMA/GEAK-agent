@@ -347,6 +347,52 @@ class TestSnapshot(_RecorderTestCase):
 
 
 # --------------------------------------------------------------------------- #
+# _tensor_attrs -- loader-set dispatch metadata torch.save would drop
+# --------------------------------------------------------------------------- #
+class TestTensorAttrs(_RecorderTestCase):
+    def test_loader_set_attribute_is_recorded_alongside_the_data(self):
+        t = FakeTensor((4, 8))
+        t.is_shuffled = True          # aiter's fused-MoE FlyDSL-vs-CK gate reads exactly this
+        got = cs._snapshot(t)
+        self.assertEqual(got["attrs"], {"is_shuffled": True})
+
+    def test_plain_tensor_records_no_attrs_key_at_all(self):
+        # Intrinsic fields (shape/dtype/device) live in FakeTensor.__dict__ too; re-recording them
+        # would let a stale duplicate override the first-class snapshot key on restore.
+        self.assertNotIn("attrs", cs._snapshot(FakeTensor((4, 8))))
+
+    def test_values_that_cannot_round_trip_are_dropped_not_repred(self):
+        # A repr string would read truthy to `getattr(w, "...", False)` and flip a dispatch gate the
+        # captured server never took -- worse than an absent attribute.
+        t = FakeTensor((4, 8))
+        t.helper = lambda: None
+        t.buddy = FakeTensor((2,))
+        t.quant_mode = "mxfp4"
+        t.tile = (16, 16)
+        self.assertEqual(cs._snapshot(t)["attrs"], {"quant_mode": "mxfp4", "tile": (16, 16)})
+
+    def test_private_and_oversized_attributes_are_bounded(self):
+        t = FakeTensor((4, 8))
+        t._internal = True
+        t.tag = "y" * 500
+        for i in range(cs._ATTR_MAX_COUNT + 10):
+            setattr(t, "k%03d" % i, i)
+        attrs = cs._snapshot(t)["attrs"]
+        self.assertNotIn("_internal", attrs)
+        self.assertEqual(len(attrs), cs._ATTR_MAX_COUNT)
+        if "tag" in attrs:
+            self.assertEqual(len(attrs["tag"]), cs._ATTR_MAX_STR)
+
+    def test_an_exploding_dict_read_yields_no_attrs_rather_than_killing_capture(self):
+        class _Hostile:
+            @property
+            def __dict__(self):
+                raise RuntimeError("no introspection")
+
+        self.assertEqual(cs._tensor_attrs(_Hostile()), {})
+
+
+# --------------------------------------------------------------------------- #
 # _wrapper -- the recording hot path
 # --------------------------------------------------------------------------- #
 class TestWrapperRecording(_RecorderTestCase):
@@ -553,7 +599,29 @@ class TestFlush(_RecorderTestCase):
         self.assertTrue(meta["oracle_complete"])
         self.assertFalse(meta["build"])
         self.assertIn("Do NOT edit", meta["note"])
+        self.assertIn("capture_env", meta)
         self.assertIn("flushed 2 case(s)", err.getvalue())
+
+    def test_meta_records_the_dispatch_steering_env_and_nothing_else(self):
+        # Which backend the captured server ran is decided by env as much as by inputs; without it a
+        # UT that reproduces the wrong kernel can only be diagnosed from server logs.
+        self._drive()
+        with _env(AITER_CONFIG_FMOE="/tmp/t.csv", VLLM_USE_FLYDSL="1", HOME="/root"), _stderr():
+            cs._flush()
+        env = self._meta()["capture_env"]
+        self.assertEqual(env.get("AITER_CONFIG_FMOE"), "/tmp/t.csv")
+        self.assertEqual(env.get("VLLM_USE_FLYDSL"), "1")
+        self.assertNotIn("HOME", env)
+
+    def test_a_credential_that_matches_the_prefixes_is_recorded_by_name_only(self):
+        """`GEAK_KB_STORE_TOKEN` matches `^GEAK_`, this runs in the SERVER process, and meta.json is
+        published with the task dir. The name is dispatch-relevant; the value is a secret."""
+        self._drive()
+        with _env(GEAK_KB_STORE_TOKEN="s3cr3t", AITER_CONFIG_FMOE="/tmp/t.csv"), _stderr():
+            cs._flush()
+        env = self._meta()["capture_env"]
+        self.assertEqual(env.get("GEAK_KB_STORE_TOKEN"), "<redacted>")
+        self.assertEqual(env.get("AITER_CONFIG_FMOE"), "/tmp/t.csv")
 
     def test_cases_carry_shapes_dtypes_and_their_real_call_count(self):
         self._drive()

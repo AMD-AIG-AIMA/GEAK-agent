@@ -38,6 +38,18 @@ _TMP_ARTIFACT_RE = re.compile(r"\.(?:pt|json)\.tmp-\d+")
 # Heuristic names for expert/static parameter tensors (used by moe_slim / share_large).
 _WEIGHT_KEY_RE = re.compile(
     r"(^w[123]$|^weight$|expert_w|gate_up|down_proj|up_proj|_weight$)", re.I)
+# Names already recorded as first-class snapshot keys: a __dict__ duplicate would override the real
+# one on restore. (Plain torch.Tensor keeps these as descriptors, but subclasses/wrappers do not.)
+_ATTR_SKIP = frozenset(("shape", "dtype", "device", "data", "contiguous", "attrs"))
+_ATTR_MAX_COUNT = 32
+_ATTR_MAX_STR = 200
+# Env that steers BACKEND DISPATCH (tuned-config tables, backend enables, arch pins) — recorded for
+# comparison only, never re-exported: replaying with a table the captured server did not have is its
+# own infidelity. Broad by design, so credential-looking names are redacted: this runs in the SERVER
+# process (GEAK_KB_STORE_TOKEN matches ^GEAK_) and meta.json is published with the task dir.
+_ENV_CAPTURE_RE = re.compile(
+    r"^(AITER|GEAK|SGLANG|VLLM|TORCH|TORCHINDUCTOR|PYTORCH|TRITON|HIP|ROCM|HSA|CK|GPU)_|FLYDSL")
+_ENV_REDACT_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CRED|AUTH|COOKIE|SESSION)", re.I)
 
 _STATE = {
     "target": None, "out_dir": None, "max_cases": 5, "num_steps": 0,
@@ -371,6 +383,21 @@ def reclaim_workspace_captures(eval_dir, workspace_budget=0):
     return telemetry
 
 
+def _env_snapshot():
+    """Dispatch-steering env of the capturing process (see ``_ENV_CAPTURE_RE``), secrets redacted.
+
+    Lets a UT that reproduces the wrong kernel be diagnosed from the task dir instead of server logs:
+    an empty ``AITER_CONFIG_FMOE`` here means the captured server ran the heuristic path, so a UT that
+    exports a tuned table is measuring a third code path deployment never took.
+    """
+    env = {}
+    for key in sorted(os.environ):
+        if _ENV_CAPTURE_RE.search(key):
+            env[key] = ("<redacted>" if _ENV_REDACT_RE.search(key)
+                        else str(os.environ[key])[:_ATTR_MAX_STR])
+    return env
+
+
 def _write_capture_manifest(out_dir, extra=None):
     """Lightweight size/shape manifest written when the heavy oracle is skipped or reclaiming."""
     s = _STATE
@@ -453,14 +480,58 @@ def _torch():
     return torch
 
 
+def _attr_value(value):
+    """``(value, keep)`` — keep only attributes that survive ``torch.save`` as plain data.
+
+    Anything else (tensors, modules, callables) is DROPPED rather than repr'd: a restored repr string
+    would still read truthy to a ``getattr(w, "...", False)`` dispatch gate.
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, True
+    if isinstance(value, str):
+        return value[:_ATTR_MAX_STR], True
+    if (isinstance(value, (list, tuple)) and len(value) <= 8
+            and all(v is None or isinstance(v, (bool, int, float, str)) for v in value)):
+        return type(value)(value), True
+    return None, False
+
+
+def _tensor_attrs(x):
+    """Loader-set Python attributes from the tensor's ``__dict__`` — ``torch.save`` drops these.
+
+    Several backends carry their DISPATCH DECISION there rather than in the data: aiter's fused-MoE
+    gate reads ``getattr(w1, "is_shuffled", False)`` to choose FlyDSL vs CK, so an oracle replayed
+    without the label runs a different kernel than the captured server did.
+    """
+    try:
+        items = list((getattr(x, "__dict__", None) or {}).items())
+    except Exception:
+        return {}
+    attrs = {}
+    for key, value in items:
+        if not isinstance(key, str) or key.startswith("_") or key in _ATTR_SKIP:
+            continue
+        attr_value, keep = _attr_value(value)
+        if not keep:
+            continue
+        attrs[key] = attr_value
+        if len(attrs) >= _ATTR_MAX_COUNT:
+            break
+    return attrs
+
+
 def _snapshot(x):
     """Detach+clone tensors to CPU so later in-place ops can't corrupt the oracle. Pass scalars/None
     through; summarize unsupported objects by repr so the record stays loadable."""
     torch = _torch()
     if torch.is_tensor(x):
-        return {"__tensor__": True, "data": x.detach().to("cpu").clone(),
+        snap = {"__tensor__": True, "data": x.detach().to("cpu").clone(),
                 "dtype": str(x.dtype), "device": str(x.device),
                 "shape": list(x.shape), "contiguous": bool(x.is_contiguous())}
+        attrs = _tensor_attrs(x)
+        if attrs:
+            snap["attrs"] = attrs
+        return snap
     if isinstance(x, (list, tuple)):
         return type(x)(_snapshot(v) for v in x)
     if isinstance(x, dict):
@@ -771,6 +842,7 @@ def _flush(write_oracle=True):
         "budget_exceeded": bool(s.get("budget_exceeded")),
         "budget_skip_count": int(s.get("budget_skip_count") or 0),
         "oracle_save_count": int(s.get("oracle_save_count") or 0),
+        "capture_env": _env_snapshot(),
         "build": False,  # default: pure-python/triton; Extractor flips to True for HIP/CK/asm tasks
         "note": "Oracle captured from baseline. Do NOT edit unittest.py or reference_io.pt during opt.",
     }

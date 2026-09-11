@@ -2307,6 +2307,108 @@ class TestRunLeg(_LegTestCase):
         self.assertIn("produced no JSON", str(cm.exception))
 
 
+class TestDeclaredAttrs(_HarnessTestCase):
+    """`meta.live_tensor_attrs` retrofits a dispatch flag onto an oracle captured before `attrs`."""
+
+    def test_a_declared_attribute_lands_on_the_named_kwarg(self):
+        w1, w2 = _T((2, 2)), _T((2, 2))
+        args = {"pos": [], "kw": {"w1": w1, "w2": w2, "doweight_stage1": False}}
+        hl.apply_declared_attrs(args, {"live_tensor_attrs": {"w1": {"is_shuffled": True},
+                                                             "w2": {"is_shuffled": True}}})
+        self.assertTrue(getattr(w1, "is_shuffled", False))
+        self.assertTrue(getattr(w2, "is_shuffled", False))
+
+    def test_a_positional_operand_is_addressable_by_index(self):
+        w = _T((2, 2))
+        args = {"pos": [_T((1,)), w], "kw": {}}
+        hl.apply_declared_attrs(args, {"live_tensor_attrs": {"pos[1]": {"is_shuffled": True}}})
+        self.assertTrue(getattr(w, "is_shuffled", False))
+
+    def test_the_other_bundle_shapes_are_accepted_too(self):
+        """The role sketch spells `call` as `fn(**args)` and `iter_eager_cases_from_oracle` yields a
+        flat mapping; rejecting those would raise "name does not land" on a perfectly good meta."""
+        flat, seq = _T((2, 2)), _T((2, 2))
+        hl.apply_declared_attrs({"w1": flat, "doweight_stage1": False},
+                                {"live_tensor_attrs": {"w1": {"is_shuffled": True}}})
+        hl.apply_declared_attrs([_T((1,)), seq],
+                                {"live_tensor_attrs": {"pos[1]": {"is_shuffled": True}}})
+        self.assertTrue(getattr(flat, "is_shuffled", False))
+        self.assertTrue(getattr(seq, "is_shuffled", False))
+
+    def test_no_declaration_is_a_no_op(self):
+        args = {"pos": [], "kw": {"w1": _T((2, 2))}}
+        self.assertIs(hl.apply_declared_attrs(args, {}), args)
+        self.assertIs(hl.apply_declared_attrs(args, {"live_tensor_attrs": None}), args)
+
+    def test_a_declaration_that_lands_on_nothing_raises_instead_of_silently_doing_nothing(self):
+        """The per-task ancestor returned early on an empty spec, so a stale name read exactly like
+        "nothing to restore" and the leg went on measuring the wrong backend."""
+        args = {"pos": [_T((1,))], "kw": {"w1": _T((2, 2)), "doweight_stage1": False}}
+        for name in ("w3", "doweight_stage1", "pos[7]"):   # unknown, non-tensor, out of range
+            with self.assertRaises(hl.HarnessIncompleteError) as cm:
+                hl.apply_declared_attrs(args, {"live_tensor_attrs": {name: {"is_shuffled": True}}})
+            self.assertIn(repr(name), str(cm.exception))
+
+
+class TestBaselineDispatchGate(_HarnessTestCase):
+    """The baseline leg must launch the kernel the task is NAMED after, else it measures a dispatch
+    flip and no existing gate can catch it (the golden was frozen from that same wrong baseline).
+    Observed on a MoE task whose oracle lost `w1.is_shuffled`: 1.55x isolated, 1.0034x e2e."""
+
+    META = {"device_kernel": "mfma_moe1_silu_mul_afp4_wfp4_bf16_t32x128x256_pm1_async_v32"}
+
+    @contextlib.contextmanager
+    def _leg(self, kernels, matcher=None):
+        def run_leg(task, overlay, mode, **kw):
+            self.assertEqual(mode, "dispatch")
+            return {"kernels": kernels}
+
+        with _patched(hl, _run_leg=run_leg,
+                      _kernel_matcher=lambda: (matcher or (lambda w, g: w == g))):
+            yield
+
+    def test_matching_kernel_passes_and_reports_the_case(self):
+        with self._leg({"prefill_M16384": ["some_memcpy", self.META["device_kernel"]]}):
+            got = hl.assert_baseline_dispatch("/t", "/t/baseline_overlay", self.META)
+        self.assertTrue(got["checked"])
+        self.assertEqual(got["matched_cases"], ["prefill_M16384"])
+
+    def test_a_different_kernel_is_a_harness_defect_not_a_correctness_failure(self):
+        """HarnessIncompleteError => "regenerate the UT" (exit 3), never "reject the candidate"."""
+        with self._leg({"prefill_M16384": ["kernel_moe_mxgemm"]}):
+            with self.assertRaises(hl.HarnessIncompleteError) as cm:
+                hl.assert_baseline_dispatch("/t", "/t/baseline_overlay", self.META)
+        why = str(cm.exception)
+        self.assertIn("kernel_moe_mxgemm", why)
+        self.assertIn(self.META["device_kernel"], why)
+        self.assertIn("Do NOT", why)   # never advise exporting a config the server did not have
+
+    def test_no_kernels_observed_is_reported_unchecked_never_a_verdict(self):
+        """Absence of evidence (CPU box, profiler unavailable) must not manufacture a failure."""
+        with self._leg({"prefill_M16384": []}):
+            got = hl.assert_baseline_dispatch("/t", "/t/baseline_overlay", self.META)
+        self.assertFalse(got["checked"])
+
+    def test_a_leg_that_cannot_run_degrades_to_unchecked_instead_of_blocking_the_measurement(self):
+        """A task dir vendored before `--mode dispatch` makes the leg exit non-zero -- not evidence
+        about dispatch. `measure_legs` calls this every time, so letting the RuntimeError out would
+        turn a gate against wrong baselines into a new way for a correct task to fail to measure."""
+        def run_leg(task, overlay, mode, **kw):
+            raise RuntimeError("leg(dispatch) exited 2: invalid choice: 'dispatch'")
+
+        with _patched(hl, _run_leg=run_leg, _kernel_matcher=lambda: (lambda w, g: w == g)):
+            got = hl.assert_baseline_dispatch("/t", "/t/baseline_overlay", self.META)
+        self.assertFalse(got["checked"])
+        self.assertIn("invalid choice", got["why"])
+
+    def test_missing_matcher_or_device_kernel_degrades_to_unchecked(self):
+        with _patched(hl, _kernel_matcher=lambda: None,
+                      _run_leg=lambda *a, **k: self.fail("must not run a leg")):
+            self.assertFalse(hl.assert_baseline_dispatch("/t", "/b", self.META)["checked"])
+        with _patched(hl, _run_leg=lambda *a, **k: self.fail("must not run a leg")):
+            self.assertFalse(hl.assert_baseline_dispatch("/t", "/b", {})["checked"])
+
+
 class TestLegTimeoutReleasesTheGpu(_LegTestCase):
     """A timed-out leg must take everything it spawned with it.
 
@@ -2663,6 +2765,46 @@ class TestBaselineRandomOutputs(_LegTestCase):
         self.assertEqual(loaded, [(dest, "cpu")])          # CPU-side, so either leg can compare it
         self.assertEqual(list(got), ["decode|0"])
 
+    def test_a_repeat_recording_gets_its_own_file_so_it_cannot_clobber_the_first(self):
+        self.torch.load = lambda path, map_location=None: {}
+        self._script(lambda cmd, env: _Proc(0, '{"out": "x", "n": 1}'))
+        hl.baseline_random_outputs(self.task, self.meta, rep=1)
+        self.assertEqual(self.sub.flag("--out"),
+                         os.path.join(self.task, "_baseline_random.rep1.pt"))
+
+
+class TestBaselineNoiseFloor(_LegTestCase):
+    """An op that reduces with atomics does not reproduce ITSELF bit-for-bit. Measure that spread
+    with the same metric the candidate is judged by, or the candidate is blamed for it."""
+
+    def _blobs(self, second):
+        blobs = {"_baseline_random.pt": {"m1|0": _T((2,), [1.0, 2.0])},
+                 "_baseline_random.rep1.pt": {"m1|0": second}}
+        self.torch.load = lambda path, map_location=None: blobs[os.path.basename(path)]
+        self._script(lambda cmd, env: _Proc(0, '{"out": "x", "n": 1}'))
+
+    def test_the_baseline_is_recorded_twice_at_the_same_seed_and_scored_against_itself(self):
+        self._blobs(_T((2,), [1.0, 2.2]))
+        floor = hl.baseline_noise_floor(self.task, self.meta, 0.01, seed=7)
+        self.assertEqual(self.sub.modes(), ["oracle", "oracle"])
+        self.assertEqual({c["cmd"][c["cmd"].index("--seed") + 1] for c in self.sub.calls}, {"7"})
+        self.assertAlmostEqual(floor["m1|0"], 0.2 / (2.0 + 0.01 * math.sqrt(2.5)), places=6)
+
+    def test_an_already_recorded_first_pass_is_reused_rather_than_paid_for_twice(self):
+        self._blobs(_T((2,), [1.0, 2.0]))
+        floor = hl.baseline_noise_floor(self.task, self.meta, 0.01,
+                                        baseline_outputs={"m1|0": _T((2,), [1.0, 2.0])})
+        self.assertEqual(self.sub.modes(), ["oracle"])     # only the REPEAT leg runs
+        self.assertEqual(floor, {"m1|0": 0.0})
+
+    def test_a_key_the_repeat_did_not_produce_gets_no_floor_instead_of_a_zero_one(self):
+        """A zero floor would read as 'proven deterministic' — the opposite of 'unmeasured'."""
+        self._blobs(_T((2,), [1.0, 2.0]))
+        floor = hl.baseline_noise_floor(self.task, self.meta, 0.01,
+                                        baseline_outputs={"m1|0": _T((2,), [1.0, 2.0]),
+                                                          "m1|1": _T((2,), [1.0, 2.0])})
+        self.assertEqual(list(floor), ["m1|0"])
+
 
 # --------------------------------------------------------------------------- #
 # The recorded-oracle arm of check_random_vs_baseline / run_correctness
@@ -2727,6 +2869,31 @@ class TestCheckRandomVsBaselineRecorded(_HarnessTestCase):
             [self._shape()], 0.01, draws=1, baseline_outputs={"m1|0": ref})
         self.assertTrue(ok, per[0].get("note"))
         self.assertEqual([t.device for t in ref], ["cpu", "cpu"])   # oracle not mutated
+
+    def test_a_deviation_inside_the_baselines_own_spread_passes_and_says_so(self):
+        """The 0.559 'relative error' that failed the FlyDSL MoE UT was the baseline against
+        ITSELF. Without this the honest candidate is failed for the op's atomic reduction order."""
+        ok, per = hl.check_random_vs_baseline(
+            None, lambda args: _T((2,), [1.0, 2.2]), [self._shape()], 0.01, draws=1,
+            baseline_outputs={"m1|0": _T((2,), [1.0, 2.0])}, noise_floor={"m1|0": 0.1})
+        self.assertTrue(ok)
+        self.assertTrue(per[0]["correct"])
+        self.assertEqual(per[0]["noise_floor"], 0.1)
+        self.assertIn("run-to-run spread", per[0]["note"])
+
+    def test_a_deviation_past_the_margin_still_fails(self):
+        ok, per = hl.check_random_vs_baseline(
+            None, lambda args: _T((2,), [1.0, 2.2]), [self._shape()], 0.01, draws=1,
+            baseline_outputs={"m1|0": _T((2,), [1.0, 2.0])}, noise_floor={"m1|0": 0.001})
+        self.assertFalse(ok)
+        self.assertFalse(per[0]["correct"])
+
+    def test_a_key_with_no_measured_floor_is_judged_as_strictly_as_before(self):
+        ok, per = hl.check_random_vs_baseline(
+            None, lambda args: _T((2,), [1.0, 2.2]), [self._shape()], 0.01, draws=1,
+            baseline_outputs={"m1|0": _T((2,), [1.0, 2.0])}, noise_floor={"other|0": 9.9})
+        self.assertFalse(ok)
+        self.assertIsNone(per[0]["noise_floor"])
 
     def test_a_candidate_that_returns_no_tensor_is_named_rather_than_compared(self):
         ok, per = hl.check_random_vs_baseline(
@@ -2845,6 +3012,31 @@ class TestOracleSharedAndLazy(_HarnessTestCase):
         self.assertIn("a", out)
         self.assertEqual(len(out["b"]), 1)
 
+    def test_reconstruct_captured_restores_loader_attrs_after_the_device_move(self):
+        """`.to()` returns a fresh tensor whose __dict__ is empty, so attrs must be re-applied AFTER.
+
+        This is the whole defect: aiter's fused-MoE gate reads `getattr(w1, "is_shuffled", False)`, so
+        an oracle replayed without the label dispatches to a different backend than the captured
+        server ran -- and the golden, frozen from that same wrong baseline, agrees with itself.
+        """
+        leaf = {"__tensor__": True, "data": _T((2,), fill=1.5),
+                "attrs": {"is_shuffled": True, "quant_mode": "mxfp4"}}
+        out = hl.reconstruct_captured(leaf, device="cuda")
+        self.assertIsNot(out, leaf["data"])          # the move really did make a new object
+        self.assertIs(getattr(out, "is_shuffled", False), True)
+        self.assertEqual(getattr(out, "quant_mode", None), "mxfp4")
+
+    def test_reconstruct_captured_without_attrs_is_unchanged(self):
+        out = hl.reconstruct_captured({"__tensor__": True, "data": _T((2,), fill=1.5)}, "cpu")
+        self.assertFalse(getattr(out, "is_shuffled", False))
+
+    def test_apply_captured_attrs_survives_a_tensor_that_refuses_setattr(self):
+        class _Frozen:
+            __slots__ = ()
+
+        frozen = _Frozen()
+        self.assertIs(hl.apply_captured_attrs(frozen, {"is_shuffled": True}), frozen)
+
     def test_reconstruct_captured_repr_and_containers(self):
         self.assertEqual(hl.reconstruct_captured({"__repr__": "x"}, "cpu"), "x")
         nested = hl.reconstruct_captured(
@@ -2915,6 +3107,25 @@ class TestOracleSharedAndLazy(_HarnessTestCase):
         self.assertIn("hidden_states", case["args"])
         self.assertIn("w1", case["args"])
         self.assertEqual(case["args"]["scale"], 1.0)
+
+    def test_eager_cases_apply_declared_attrs_when_meta_is_passed(self):
+        """Otherwise the retrofit reaches the TIMING legs (cases.py applies it) but not the frozen
+        correctness cases, and the two gates grade different backends. No meta => unchanged."""
+        blob = {
+            "shared": {},
+            "records": [{
+                "sig": "s0",
+                "args": (),
+                "kwargs": {"w1": {"__tensor__": True, "data": _T((2, 2), fill=1.0)}},
+                "output": {"__tensor__": True, "data": _T((2,), fill=2.0)},
+            }],
+        }
+        self.torch.load = lambda *a, **k: blob
+        plain = next(hl.iter_eager_cases_from_oracle("ref.pt"))
+        self.assertFalse(getattr(plain["args"]["w1"], "is_shuffled", False))
+        meta = {"live_tensor_attrs": {"w1": {"is_shuffled": True}}}
+        case = next(hl.iter_eager_cases_from_oracle("ref.pt", meta=meta))
+        self.assertTrue(getattr(case["args"]["w1"], "is_shuffled", False))
 
     def test_check_correct_multi_lazy_runs_independence_with_two_cases(self):
         def call(args):
