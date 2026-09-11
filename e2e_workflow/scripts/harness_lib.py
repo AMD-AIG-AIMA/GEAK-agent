@@ -554,13 +554,11 @@ def to_device_like(ref, dev):
 def apply_captured_attrs(t, attrs):
     """Re-attach the loader-set attributes ``capture_shapes._tensor_attrs`` recorded.
 
-    MUST run AFTER any ``.to(device)``: ``.to()`` returns a fresh tensor whose ``__dict__`` is empty,
-    so attributes applied before the move are silently dropped — which is exactly how a replayed MoE
-    oracle loses ``w1.is_shuffled`` and falls into a different dispatch branch than deployment.
+    MUST run AFTER any ``.to(device)``: ``.to()`` returns a fresh tensor with an empty ``__dict__``,
+    so attributes applied before the move are silently dropped — exactly how a replayed MoE oracle
+    loses ``w1.is_shuffled`` and falls into a different dispatch branch than deployment.
     """
-    if not attrs:
-        return t
-    for key, value in attrs.items():
+    for key, value in (attrs or {}).items():
         try:
             setattr(t, key, value)
         except (AttributeError, RuntimeError, TypeError):
@@ -586,24 +584,18 @@ def reconstruct_captured(obj, device="cpu"):
 def apply_declared_attrs(args, meta):
     """Apply ``meta.live_tensor_attrs`` = {operand: {attr: value}} to a rehydrated ``args`` bundle.
 
-    This is the RETROFIT path, for an oracle captured before ``capture_shapes`` recorded per-tensor
-    ``attrs``: the blob carries the loader's preshuffled BYTES with the loader's FLAG stripped, and
-    the flag cannot be recovered from the file. Declaring it in meta.json restores it. A capture that
-    HAS ``attrs`` needs nothing here — ``reconstruct_captured`` already replays it, and this is a
-    no-op unless meta also declares something (an explicit declaration wins, so a hand-written
-    correction can override a bad recording).
+    The RETROFIT path for an oracle captured before ``capture_shapes`` recorded ``attrs``: the blob
+    carries the loader's preshuffled BYTES with its FLAG stripped, unrecoverable from the file, so the
+    declaration is the only repair short of recapturing. A capture that HAS ``attrs`` needs nothing —
+    ``reconstruct_captured`` replays those, and an explicit declaration overrides them.
 
-    ``args`` is whatever bundle cases.py passes to ``call``. BOTH shapes in use are accepted: the
-    ``{"pos": [...], "kw": {...}}`` split that generated tasks build, and the flat kwargs mapping the
-    role sketch spells ``fn(**args)`` (which is also what ``iter_eager_cases_from_oracle`` yields). A
-    bare list/tuple of positionals works too. Accepting only one of them would make a shape mismatch
-    raise the "name does not land" error below and send the author to audit a meta key that is fine.
-    An operand is addressed by kwarg name, or by ``"pos[<i>]"`` for a positional.
+    Operands are addressed by kwarg name, or ``"pos[<i>]"`` for a positional, in any of the bundle
+    shapes in use: the ``{"pos", "kw"}`` split, a flat kwargs mapping (``fn(**args)``, which is what
+    ``iter_eager_cases_from_oracle`` yields), or a bare positional sequence.
 
-    RAISES on a declaration that matches no operand: this mechanism previously shipped as a per-task
-    helper that returned early on an empty spec, so a typo'd or stale name read exactly like "nothing
-    to restore" and the UT went on quietly measuring the wrong dispatch branch. A declaration that
-    does not land is a defect in the UT, not a condition to tolerate.
+    RAISES on a declaration that matches no operand. The per-task helper this replaces returned early
+    on an empty spec, so a typo'd or stale name read exactly like "nothing to restore" and the leg
+    went on quietly measuring the wrong backend — the failure this mechanism exists to prevent.
     """
     spec = (meta or {}).get("live_tensor_attrs") or {}
     if not spec:
@@ -666,9 +658,8 @@ def resolve_oracle_shared(obj, shared):
 def iter_eager_cases_from_oracle(path, device="cpu", meta=None):
     """Yield ``{args, ref, sig, regime}`` one record at a time (memory-friendly for multi-GiB MoE).
 
-    Pass ``meta`` whenever the task declares ``live_tensor_attrs``: without it the CORRECTNESS cases
-    come back missing the dispatch flag the timing legs were retrofitted with, so the two gates grade
-    different backends — the split this whole mechanism exists to close.
+    Pass ``meta`` when the task declares ``live_tensor_attrs``, else the correctness cases miss the
+    dispatch flag the timing legs were retrofitted with and the two gates grade different backends.
     """
     blob = load_reference_io(path, map_location="cpu")
     shared = blob.get("shared") or {}
@@ -1446,34 +1437,30 @@ def assert_legs_differ(task_dir, base, cand, meta, timeout=600):
 def _kernel_matcher():
     """``kernel_matches`` from the vendored ``kernel_selection.py``, or None when it is absent.
 
-    Deliberately NOT re-implemented here: ``canonical_kernel_name`` must stay byte-identical to
-    ``canonicalDeviceKernel`` in e2e_workflow.js, and a second copy is a second thing to drift. The
-    extractor vendors ``kernel_selection.py`` into the task dir next to this file for exactly this.
+    Deliberately NOT re-implemented: ``canonical_kernel_name`` must stay identical to
+    ``canonicalDeviceKernel`` in e2e_workflow.js, and a second copy is a second thing to drift.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    for name, path in (("kernel_selection", os.path.join(here, "kernel_selection.py")),):
-        try:
-            if name in sys.modules:
-                return getattr(sys.modules[name], "kernel_matches")
+    name = "kernel_selection"
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
+    try:
+        if name not in sys.modules:
             if not os.path.exists(path):
                 return None
             spec = importlib.util.spec_from_file_location(name, path)
             mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)   # register only once it imported, never a half-built module
             sys.modules[name] = mod
-            spec.loader.exec_module(mod)
-            return getattr(mod, "kernel_matches")
-        except Exception:
-            return None
-    return None
+        return getattr(sys.modules[name], "kernel_matches")
+    except Exception:
+        return None
 
 
 def observed_device_kernels(call, cases, warmup=2):
-    """GPU kernel names one call of each case actually launches, newest-profile first.
+    """GPU kernel names one call of each case actually launches, read off a one-shot profile.
 
     The oracle records the op's INPUTS, never the process configuration that steers backend dispatch
-    (tuned-config env, backend enables, loader-set weight attributes). So a task can name itself after
-    one kernel and, on replay, run a different one end to end. This reads the kernel names off a
-    one-shot profile so that divergence is observable rather than silent.
+    (tuned-config env, backend enables, loader-set weight attributes) — so a task can name itself
+    after one kernel and, on replay, run a different one. This makes that divergence observable.
     """
     torch = _torch()
     from torch.profiler import ProfilerActivity, profile
@@ -1503,18 +1490,14 @@ def observed_device_kernels(call, cases, warmup=2):
 def assert_baseline_dispatch(task_dir, base, meta, timeout=600):
     """Refuse to measure unless the BASELINE leg launches the kernel this task is named after.
 
-    The baseline leg is supposed to BE deployment. When it is not — because the replayed oracle lost a
-    loader-set dispatch label, or the capture-time env is not reproduced — every downstream number is
-    about a kernel production never ran, and the correctness gate cannot catch it: the golden was
-    frozen from that same wrong baseline, so it agrees with itself.
+    When it does not — the replayed oracle lost a loader-set dispatch label, the capture-time env is
+    not reproduced — every downstream number is about a kernel production never ran, and correctness
+    cannot catch it: the golden was frozen from that same wrong baseline, so it agrees with itself.
 
-    Raises ``HarnessIncompleteError`` (UT-GENERATION defect, exit 3 — NOT a candidate-correctness
-    failure) rather than returning False, so a mismatch reads as "regenerate the UT", never as
-    "reject the kernel". Skipped with a note when the evidence cannot be gathered at all — the profile
-    yields no kernel names (CPU-only box), or the dispatch leg itself does not run (older vendored
-    leg_runner.py without the mode, no torch.profiler). Absence of evidence must not manufacture a
-    verdict in EITHER direction: this gate exists to catch a wrong baseline, not to become a new way
-    for a correct task to fail to measure.
+    Raises ``HarnessIncompleteError`` (UT-GENERATION defect, exit 3) rather than returning False, so a
+    mismatch reads as "regenerate the UT", never "reject the kernel". Returns ``checked: False`` — never
+    a verdict — when the evidence cannot be gathered at all (no kernel names in the profile, or the
+    dispatch leg does not run: task dir vendored before the mode, no torch.profiler).
     """
     want = str((meta or {}).get("device_kernel") or "").strip()
     matches = _kernel_matcher()
@@ -1524,10 +1507,8 @@ def assert_baseline_dispatch(task_dir, base, meta, timeout=600):
     try:
         observed = _run_leg(os.path.abspath(task_dir), base, "dispatch", timeout=timeout)
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
-        # A leg that will not RUN is not a leg that ran the wrong kernel. Task dirs vendored before
-        # this mode existed reject `--mode dispatch` at argparse, and a box without torch.profiler
-        # raises on import; neither is evidence about dispatch, so degrade instead of blocking a
-        # measurement that is otherwise fine.
+        # A leg that will not RUN is not a leg that ran the wrong kernel — degrade rather than block
+        # an otherwise fine measurement.
         return {"checked": False, "why": f"dispatch leg did not run: {str(exc)[:300]}",
                 "device_kernel": want}
     per_case = (observed or {}).get("kernels") or {}
@@ -1539,15 +1520,12 @@ def assert_baseline_dispatch(task_dir, base, meta, timeout=600):
         reason = (
             f"baseline leg never launches meta.device_kernel {want!r}; it launched "
             f"{sorted(set(all_names))[:8]}. The task is named after one kernel and measures another, "
-            "so its speedup is a DISPATCH FLIP, not an optimization. Usual causes, in order: (1) the "
-            "oracle lost a loader-set weight attribute that gates the backend (capture_shapes records "
-            "these under 'attrs'; an oracle frozen before that carries none, and is repaired either by "
-            "recapturing or — when the attribute and its deployment value are known — by declaring it "
-            "in meta.live_tensor_attrs and applying it with apply_declared_attrs after rehydration), "
-            "(2) meta.capture_env differs from this process's env, (3) meta.device_kernel names a "
-            "kernel the selected seam does not reach. Recapture or re-select the seam — do NOT 'fix' "
-            "this by exporting a tuned config the captured server did not have, which is a THIRD code "
-            "path.")
+            "so its speedup is a DISPATCH FLIP, not an optimization. Causes, in order: (1) the oracle "
+            "lost a loader-set weight attribute that gates the backend — recapture, or declare it in "
+            "meta.live_tensor_attrs and apply it with apply_declared_attrs after rehydration; "
+            "(2) meta.capture_env differs from this process's env; (3) meta.device_kernel names a "
+            "kernel the selected seam does not reach. Do NOT 'fix' this by exporting a tuned config "
+            "the captured server did not have — that is a THIRD code path.")
         print(f"{UT_HARNESS_INCOMPLETE_SENTINEL}: {reason}")
         raise HarnessIncompleteError(reason)
     return {"checked": True, "device_kernel": want, "matched_cases": sorted(hit),

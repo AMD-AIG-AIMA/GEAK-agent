@@ -118,10 +118,8 @@ def main():
     graph = h.deployment_graph_mode(regime)
 
     if a.mode == "dispatch":
-        # Which GPU kernels this leg ACTUALLY launches. Read on the baseline leg by
-        # harness_lib.assert_baseline_dispatch to prove the leg is deployment's code path and not a
-        # different backend the replayed oracle fell into. Never gate the CANDIDATE on this: changing
-        # which kernel runs is what a candidate is FOR.
+        # Which GPU kernels this leg ACTUALLY launches. Read on the BASELINE leg only, by
+        # harness_lib.assert_baseline_dispatch — changing which kernel runs is what a candidate is FOR.
         sel = [c for c in cases.timing_cases(h, meta) if not a.bucket or c["sig"] == a.bucket]
         print(json.dumps({
             "kernels": h.observed_device_kernels(lambda c: call(c["args"]), sel),

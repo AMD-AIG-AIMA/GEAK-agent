@@ -2324,54 +2324,36 @@ class TestDeclaredAttrs(_HarnessTestCase):
         hl.apply_declared_attrs(args, {"live_tensor_attrs": {"pos[1]": {"is_shuffled": True}}})
         self.assertTrue(getattr(w, "is_shuffled", False))
 
-    def test_the_flat_kwargs_shape_is_accepted_too(self):
-        """The role sketch spells `call` as `fn(**args)`, and `iter_eager_cases_from_oracle` yields a
-        flat mapping. Accepting only the pos/kw split would raise "name does not land" on a perfectly
-        good meta and send the author auditing the wrong file."""
-        w1 = _T((2, 2))
-        args = {"w1": w1, "doweight_stage1": False}
-        hl.apply_declared_attrs(args, {"live_tensor_attrs": {"w1": {"is_shuffled": True}}})
-        self.assertTrue(getattr(w1, "is_shuffled", False))
-
-    def test_a_bare_positional_sequence_is_accepted_too(self):
-        w = _T((2, 2))
-        hl.apply_declared_attrs([_T((1,)), w], {"live_tensor_attrs": {"pos[1]": {"is_shuffled": True}}})
-        self.assertTrue(getattr(w, "is_shuffled", False))
+    def test_the_other_bundle_shapes_are_accepted_too(self):
+        """The role sketch spells `call` as `fn(**args)` and `iter_eager_cases_from_oracle` yields a
+        flat mapping; rejecting those would raise "name does not land" on a perfectly good meta."""
+        flat, seq = _T((2, 2)), _T((2, 2))
+        hl.apply_declared_attrs({"w1": flat, "doweight_stage1": False},
+                                {"live_tensor_attrs": {"w1": {"is_shuffled": True}}})
+        hl.apply_declared_attrs([_T((1,)), seq],
+                                {"live_tensor_attrs": {"pos[1]": {"is_shuffled": True}}})
+        self.assertTrue(getattr(flat, "is_shuffled", False))
+        self.assertTrue(getattr(seq, "is_shuffled", False))
 
     def test_no_declaration_is_a_no_op(self):
         args = {"pos": [], "kw": {"w1": _T((2, 2))}}
         self.assertIs(hl.apply_declared_attrs(args, {}), args)
         self.assertIs(hl.apply_declared_attrs(args, {"live_tensor_attrs": None}), args)
 
-    def test_a_declaration_that_matches_no_operand_raises_instead_of_silently_doing_nothing(self):
-        """The per-task ancestor of this helper returned early on an empty spec, so a stale operand
-        name read exactly like "nothing to restore" -- and the leg went on measuring the wrong
-        backend. A declaration that does not land is a UT defect, hence HarnessIncompleteError."""
-        args = {"pos": [], "kw": {"w1": _T((2, 2))}}
-        with self.assertRaises(hl.HarnessIncompleteError) as cm:
-            hl.apply_declared_attrs(args, {"live_tensor_attrs": {"w3": {"is_shuffled": True}}})
-        self.assertIn("'w3'", str(cm.exception))
-
-    def test_a_declared_name_bound_to_a_non_tensor_also_raises(self):
-        """`doweight_stage1=False` is a real kwarg of this seam; setattr on a bool would be lost."""
-        args = {"pos": [], "kw": {"doweight_stage1": False}}
-        with self.assertRaises(hl.HarnessIncompleteError):
-            hl.apply_declared_attrs(args, {"live_tensor_attrs": {"doweight_stage1": {"x": 1}}})
-
-    def test_an_out_of_range_positional_index_raises(self):
-        args = {"pos": [_T((1,))], "kw": {}}
-        with self.assertRaises(hl.HarnessIncompleteError):
-            hl.apply_declared_attrs(args, {"live_tensor_attrs": {"pos[7]": {"is_shuffled": True}}})
+    def test_a_declaration_that_lands_on_nothing_raises_instead_of_silently_doing_nothing(self):
+        """The per-task ancestor returned early on an empty spec, so a stale name read exactly like
+        "nothing to restore" and the leg went on measuring the wrong backend."""
+        args = {"pos": [_T((1,))], "kw": {"w1": _T((2, 2)), "doweight_stage1": False}}
+        for name in ("w3", "doweight_stage1", "pos[7]"):   # unknown, non-tensor, out of range
+            with self.assertRaises(hl.HarnessIncompleteError) as cm:
+                hl.apply_declared_attrs(args, {"live_tensor_attrs": {name: {"is_shuffled": True}}})
+            self.assertIn(repr(name), str(cm.exception))
 
 
 class TestBaselineDispatchGate(_HarnessTestCase):
-    """The baseline leg must launch the kernel the task is NAMED after.
-
-    When it does not, the task measures a dispatch flip rather than an optimization -- and no existing
-    gate can catch it, because the golden was frozen from that same wrong baseline and so agrees with
-    itself. Observed on a real MoE task whose oracle had lost `w1.is_shuffled`: named after a FlyDSL
-    kernel, ran CK end to end, reported 1.55x isolated and 1.0034x e2e.
-    """
+    """The baseline leg must launch the kernel the task is NAMED after, else it measures a dispatch
+    flip and no existing gate can catch it (the golden was frozen from that same wrong baseline).
+    Observed on a MoE task whose oracle lost `w1.is_shuffled`: 1.55x isolated, 1.0034x e2e."""
 
     META = {"device_kernel": "mfma_moe1_silu_mul_afp4_wfp4_bf16_t32x128x256_pm1_async_v32"}
 
@@ -2399,8 +2381,7 @@ class TestBaselineDispatchGate(_HarnessTestCase):
         why = str(cm.exception)
         self.assertIn("kernel_moe_mxgemm", why)
         self.assertIn(self.META["device_kernel"], why)
-        # It must NOT advise exporting a tuned config the captured server did not have.
-        self.assertIn("do NOT", why)
+        self.assertIn("Do NOT", why)   # never advise exporting a config the server did not have
 
     def test_no_kernels_observed_is_reported_unchecked_never_a_verdict(self):
         """Absence of evidence (CPU box, profiler unavailable) must not manufacture a failure."""
@@ -2409,11 +2390,9 @@ class TestBaselineDispatchGate(_HarnessTestCase):
         self.assertFalse(got["checked"])
 
     def test_a_leg_that_cannot_run_degrades_to_unchecked_instead_of_blocking_the_measurement(self):
-        """A task dir vendored before `--mode dispatch` existed makes the leg exit non-zero.
-
-        That is not evidence about dispatch, and `measure_legs` calls this before every measurement:
-        letting the RuntimeError out would turn a gate against wrong baselines into a new way for a
-        correct task to fail to measure at all."""
+        """A task dir vendored before `--mode dispatch` makes the leg exit non-zero -- not evidence
+        about dispatch. `measure_legs` calls this every time, so letting the RuntimeError out would
+        turn a gate against wrong baselines into a new way for a correct task to fail to measure."""
         def run_leg(task, overlay, mode, **kw):
             raise RuntimeError("leg(dispatch) exited 2: invalid choice: 'dispatch'")
 
@@ -3066,8 +3045,7 @@ class TestOracleSharedAndLazy(_HarnessTestCase):
 
     def test_eager_cases_apply_declared_attrs_when_meta_is_passed(self):
         """Otherwise the retrofit reaches the TIMING legs (cases.py applies it) but not the frozen
-        correctness cases, and the two gates grade different backends -- the split this mechanism
-        exists to close. No meta => unchanged, so old callers keep working."""
+        correctness cases, and the two gates grade different backends. No meta => unchanged."""
         blob = {
             "shared": {},
             "records": [{

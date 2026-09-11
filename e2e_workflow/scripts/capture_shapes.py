@@ -38,26 +38,17 @@ _TMP_ARTIFACT_RE = re.compile(r"\.(?:pt|json)\.tmp-\d+")
 # Heuristic names for expert/static parameter tensors (used by moe_slim / share_large).
 _WEIGHT_KEY_RE = re.compile(
     r"(^w[123]$|^weight$|expert_w|gate_up|down_proj|up_proj|_weight$)", re.I)
-# Loader-attached tensor metadata (see _tensor_attrs). Intrinsic tensor fields are already recorded
-# as first-class snapshot keys; re-recording them from __dict__ would let a stale duplicate override
-# the real one on restore.
-_ATTR_SKIP = frozenset((
-    "shape", "dtype", "device", "data", "grad", "grad_fn", "requires_grad",
-    "names", "layout", "T", "mT", "real", "imag", "attrs", "contiguous",
-))
+# Names already recorded as first-class snapshot keys: a __dict__ duplicate would override the real
+# one on restore. (Plain torch.Tensor keeps these as descriptors, but subclasses/wrappers do not.)
+_ATTR_SKIP = frozenset(("shape", "dtype", "device", "data", "contiguous", "attrs"))
 _ATTR_MAX_COUNT = 32
 _ATTR_MAX_STR = 200
-# Environment that steers BACKEND DISPATCH (tuned-config tables, backend enables, arch pins). The
-# oracle records what the op was called with but not what the process was configured with, so a UT
-# replaying it cannot tell whether it reproduces the captured server's dispatch or a different one.
-# Recorded for comparison only — never re-exported automatically, since replaying with a table the
-# captured server did not have is its own infidelity.
+# Env that steers BACKEND DISPATCH (tuned-config tables, backend enables, arch pins) — recorded for
+# comparison only, never re-exported: replaying with a table the captured server did not have is its
+# own infidelity. Broad by design, so credential-looking names are redacted: this runs in the SERVER
+# process (GEAK_KB_STORE_TOKEN matches ^GEAK_) and meta.json is published with the task dir.
 _ENV_CAPTURE_RE = re.compile(
     r"^(AITER|GEAK|SGLANG|VLLM|TORCH|TORCHINDUCTOR|PYTORCH|TRITON|HIP|ROCM|HSA|CK|GPU)_|FLYDSL")
-# ...minus anything that carries a credential. The prefixes above are broad on purpose, and the
-# capturing process is the SERVER process, which holds the pipeline's own secrets: `GEAK_KB_STORE_TOKEN`
-# matches `^GEAK_`. meta.json travels with the task dir into the KB, so a captured token would be
-# published. The name is kept (it is still dispatch-relevant that the variable was set); the value is not.
 _ENV_REDACT_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CRED|AUTH|COOKIE|SESSION)", re.I)
 
 _STATE = {
@@ -393,14 +384,11 @@ def reclaim_workspace_captures(eval_dir, workspace_budget=0):
 
 
 def _env_snapshot():
-    """Dispatch-steering environment of the capturing process (see ``_ENV_CAPTURE_RE``).
+    """Dispatch-steering env of the capturing process (see ``_ENV_CAPTURE_RE``), secrets redacted.
 
-    Lets a UT that reproduces the wrong kernel be diagnosed from the task dir instead of from server
-    logs: an empty ``AITER_CONFIG_FMOE`` here means the captured server ran the heuristic path, so a
-    UT that exports a tuned table is measuring a third code path that deployment never took.
-
-    Credential-looking names are recorded with their value replaced by ``"<redacted>"`` (see
-    ``_ENV_REDACT_RE``) — this runs inside the server process and meta.json is published with the task.
+    Lets a UT that reproduces the wrong kernel be diagnosed from the task dir instead of server logs:
+    an empty ``AITER_CONFIG_FMOE`` here means the captured server ran the heuristic path, so a UT that
+    exports a tuned table is measuring a third code path deployment never took.
     """
     env = {}
     for key in sorted(os.environ):
@@ -492,37 +480,28 @@ def _torch():
     return torch
 
 
-def _attr_value(value, depth=0):
+def _attr_value(value):
     """``(value, keep)`` — keep only attributes that survive ``torch.save`` as plain data.
 
-    Anything else (tensors, modules, callables, arbitrary objects) is dropped rather than repr'd: an
-    attribute the UT cannot faithfully restore is worse than an absent one, because a restored repr
-    string would still read truthy to a ``getattr(w, "...", False)`` dispatch gate.
+    Anything else (tensors, modules, callables) is DROPPED rather than repr'd: a restored repr string
+    would still read truthy to a ``getattr(w, "...", False)`` dispatch gate.
     """
     if value is None or isinstance(value, (bool, int, float)):
         return value, True
     if isinstance(value, str):
         return value[:_ATTR_MAX_STR], True
-    if depth == 0 and isinstance(value, (list, tuple)) and len(value) <= 8:
-        items = []
-        for item in value:
-            item_value, keep = _attr_value(item, depth + 1)
-            if not keep:
-                return None, False
-            items.append(item_value)
-        return type(value)(items), True
+    if (isinstance(value, (list, tuple)) and len(value) <= 8
+            and all(v is None or isinstance(v, (bool, int, float, str)) for v in value)):
+        return type(value)(value), True
     return None, False
 
 
 def _tensor_attrs(x):
-    """Loader-set Python attributes living in the tensor's ``__dict__``.
+    """Loader-set Python attributes from the tensor's ``__dict__`` — ``torch.save`` drops these.
 
-    ``torch.save`` persists storage + dtype + shape but NOT attributes attached with ``setattr``, and
-    several backends carry their DISPATCH DECISION there rather than in the data: aiter's fused-MoE
-    gate reads ``getattr(w1, "is_shuffled", False)`` to choose FlyDSL vs CK. An oracle replayed
-    without that label silently runs a different kernel than the captured server did — the UT is then
-    named after one kernel and measures another, and its "speedup" is the branch flip, not the patch.
-    Intrinsic tensor fields are skipped; only extra metadata is recorded.
+    Several backends carry their DISPATCH DECISION there rather than in the data: aiter's fused-MoE
+    gate reads ``getattr(w1, "is_shuffled", False)`` to choose FlyDSL vs CK, so an oracle replayed
+    without the label runs a different kernel than the captured server did.
     """
     try:
         items = list((getattr(x, "__dict__", None) or {}).items())

@@ -614,8 +614,8 @@ class TestFlush(_RecorderTestCase):
         self.assertNotIn("HOME", env)
 
     def test_a_credential_that_matches_the_prefixes_is_recorded_by_name_only(self):
-        """`GEAK_KB_STORE_TOKEN` matches `^GEAK_`, this runs inside the SERVER process, and meta.json
-        travels with the task dir into the KB. The name is dispatch-relevant; the value is a secret."""
+        """`GEAK_KB_STORE_TOKEN` matches `^GEAK_`, this runs in the SERVER process, and meta.json is
+        published with the task dir. The name is dispatch-relevant; the value is a secret."""
         self._drive()
         with _env(GEAK_KB_STORE_TOKEN="s3cr3t", AITER_CONFIG_FMOE="/tmp/t.csv"), _stderr():
             cs._flush()

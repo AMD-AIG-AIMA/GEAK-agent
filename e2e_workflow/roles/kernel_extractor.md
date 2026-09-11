@@ -38,28 +38,25 @@ You are invoked once per kernel candidate. Read first:
 `unittest.py` imports `harness_lib` for ALL timing + correctness — never hand-roll a timing loop or an
 allclose check. This is what makes every task measure the same way; it also keeps the task
 self-contained + immutable (the validator sha-checks them alongside `reference_io.pt`).
-`kernel_selection.py` is vendored for its kernel-name matcher only (stdlib-only, no torch): without it
-`h.assert_baseline_dispatch` degrades to a no-op and the baseline is never proven to be deployment's
-code path.
+`kernel_selection.py` supplies the kernel-name matcher only (stdlib-only, no torch); without it
+`h.assert_baseline_dispatch` degrades to a no-op and the baseline is never proven to be deployment.
 
 🔴 **Rehydrate the oracle with `h.reconstruct_captured` — never hand-roll the walk.** `capture_shapes`
 records more than data+dtype+shape: loader-set Python attributes (`attrs`) carry BACKEND DISPATCH
-DECISIONS, e.g. aiter's fused-MoE gate reads `getattr(w1, "is_shuffled", False)` to choose FlyDSL vs
-CK. `torch.save` does not persist them and `.to(device)` returns a fresh tensor that drops them, so a
-hand-written rehydrator silently replays the op on a DIFFERENT kernel than the captured server ran —
-and the golden, frozen from that same wrong baseline, agrees with itself. `h.reconstruct_captured`
-(and `h.iter_eager_cases_from_oracle` / `h.eager_cases_from_oracle`, which call it) re-apply `attrs`
-after the device move. If a task genuinely needs an extra step (e.g. a uint8 raw view for a packed
-fp4 operand), wrap `h.reconstruct_captured` — do not replace it.
+DECISIONS — aiter's fused-MoE gate reads `getattr(w1, "is_shuffled", False)` to choose FlyDSL vs CK.
+`torch.save` does not persist them and `.to(device)` drops them, so a hand-written rehydrator silently
+replays the op on a DIFFERENT kernel than the captured server ran — and the golden, frozen from that
+same wrong baseline, agrees with itself. `h.reconstruct_captured` (and `h.eager_cases_from_oracle`,
+which calls it) re-apply `attrs` after the device move. Need an extra step (a uint8 raw view for a
+packed fp4 operand)? Wrap it — do not replace it.
 
-If the rehydration genuinely cannot preserve the attribute — the operand is rebuilt by `.view(dt)` or
-`.set_()`, both of which return a fresh tensor — declare it in `meta.live_tensor_attrs`
-(`{operand: {attr: value}}`, `"pos[<i>]"` for a positional) and call `h.apply_declared_attrs(args, META)`
-ONCE, at the single point every case set draws its operands from, AFTER rehydration. Same rule for an
-oracle captured before `attrs` existed: the flag is not in the file and cannot be recovered from it, so
-declaring the deployment value is the only repair short of recapturing. Record WHY the declared value is
-deployment's (a server.log line, a profile) — it is an assertion about a run that already happened, and
-`assert_baseline_dispatch` only proves the result reaches the right kernel, not that the value is right.
+When rehydration genuinely cannot preserve the attribute (`.view(dt)`/`.set_()` return fresh tensors),
+or the oracle predates `attrs` and the flag is simply not in the file, declare it in
+`meta.live_tensor_attrs` (`{operand: {attr: value}}`, `"pos[<i>]"` for a positional) and call
+`h.apply_declared_attrs(args, META)` ONCE, after rehydration, where every case set draws its operands —
+and pass `META` to `h.eager_cases_from_oracle` so correctness gets it too. Record WHY the declared value
+is deployment's (a server.log line, a profile): `assert_baseline_dispatch` proves the result reaches the
+right kernel, not that the value is right.
 
 ### 🔴 THE TWO LEGS ARE THE SAME CODE UNDER TWO PYTHONPATHS — read this before writing anything
 There is no `baseline_callable`, and no second copy of the source to time against. Both legs run the
@@ -493,12 +490,10 @@ freeze an out-of-regime oracle nobody should trust.
    > **Exit-code contract — a missing replay leg or a wrong baseline is a UT DEFECT, not a kernel/smoke
    > failure.** TWO harness calls raise `h.HarnessIncompleteError`: `h.run_correctness(...)`, when a
    > graph-deploy kernel (`cuda_graph=true`) was wired no ≥2-shape replay bundle, and `h.measure_legs(...)`,
-   > when `h.assert_baseline_dispatch` finds the BASELINE leg never launches `meta.device_kernel`. Both
-   > have ALREADY printed the `UT_HARNESS_INCOMPLETE: …` sentinel line themselves (so the smoke sees it
-   > even if `main()` forgets to catch). The generated `main()` MUST translate the exception to a
-   > DEDICATED exit code — wrap **both** calls, not just correctness, or a dispatch mismatch escapes as
-   > an uncaught traceback and is scored as exit 1, the one code reserved for a genuine kernel failure.
-   > Do NOT re-print the sentinel (it is already on stdout — a second print is just noise):
+   > when the BASELINE leg never launches `meta.device_kernel`. Both have ALREADY printed the
+   > `UT_HARNESS_INCOMPLETE: …` sentinel themselves. The generated `main()` MUST wrap **both** — not just
+   > correctness, or a dispatch mismatch escapes as an uncaught traceback and scores exit 1, the code
+   > reserved for a genuine kernel failure. Do NOT re-print the sentinel (already on stdout):
    > ```python
    > try:
    >     per_case = h.measure_legs(TASK, META)                    # raises if the baseline is not deployment
